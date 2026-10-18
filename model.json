@@ -1,0 +1,21 @@
+{
+  "defaults": {
+    "latestGenerationOnly": true,
+    "preferDirectProvider": true,
+    "crossFamilyReview": true
+  },
+  "select": [
+    "codex:all",
+
+    "claude:all",
+    "claude:!fable",
+
+    "opencode:gemini-4*, gemini-3.8*, glm-5.3*, kimi-k3, deepseek-v4*"
+  ],
+  "reasoning": {
+    "frontier": "high",
+    "workhorse": "medium",
+    "reviewer": "high",
+    "fast": "medium"
+  }
+}

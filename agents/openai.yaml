@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Router"
+  short_description: "Plan, auto-route tasks across models, and orchestrate subagents"
+  default_prompt: "Use $task-router to investigate, route models for, and plan this task:"
