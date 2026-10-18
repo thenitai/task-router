@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { formatMarkdown, matchesPattern, parseSelectRules, resolveModels } from "../scripts/resolve-models.mjs";
+import { formatMarkdown, resolveModels } from "../scripts/resolve-models.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultConfig = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "model.json"), "utf8"));
@@ -23,11 +23,11 @@ test("default model.json resolves expected models and excludes claude-fable and 
 	assert.ok(!ids.includes("claude-opus-4-8"), "excludes legacy claude-opus-4-8");
 	assert.ok(ids.includes("google/gemini-4-argon"), "includes google/gemini-4-argon");
 	assert.ok(ids.includes("opencode/gemini-3.8-flash"), "includes opencode/gemini-3.8-flash");
-	assert.ok(ids.includes("opencode/glm-5.3"), "includes opencode/glm-5.3");
-	assert.ok(ids.includes("opencode/glm-5.3-flash"), "includes opencode/glm-5.3-flash");
+	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3"), "includes cloudflare-workers-ai glm-5.3");
+	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash"), "includes cloudflare-workers-ai glm-5.3-flash");
 	assert.ok(ids.includes("opencode/kimi-k3"), "includes opencode/kimi-k3");
-	assert.ok(ids.includes("opencode/deepseek-v4-pro"), "includes opencode/deepseek-v4-pro");
-	assert.ok(ids.includes("opencode/deepseek-v4.1-flash"), "includes opencode/deepseek-v4.1-flash");
+	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813"), "includes cloudflare-workers-ai deepseek-v4-pro");
+	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"), "includes cloudflare-workers-ai deepseek-v4-flash");
 });
 
 test("supports codex:!luna exclusion shorthand", () => {
@@ -45,6 +45,32 @@ test("enforces cross-family reviewer when multiple model families are active", (
 	assert.ok(reviewer, "selects a reviewer");
 	assert.notEqual(impl.family, reviewer.family, "reviewer must be a different family from implementer");
 	assert.equal(reviewer.reasoning, "high");
+});
+
+test("skips disabled T3 providers and respects hiddenModels + connected OpenCode gateways", () => {
+	const catalog = [
+		{ providerInstanceId: "codex", id: "gpt-6.1-sol", label: "GPT-6.1-Sol" },
+		{ providerInstanceId: "claudeAgent", id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+		{ providerInstanceId: "opencode", id: "opencode/glm-5.3", label: "GLM 5.3" },
+		{ providerInstanceId: "opencode", id: "cloudflare-workers-ai/@cf/zai-org/glm-5.3", label: "GLM 5.3" },
+		{ providerInstanceId: "opencode", id: "github-copilot/gemini-4-argon", label: "Gemini 4 Argon" },
+		{ providerInstanceId: "opencode", id: "google/gemini-4-argon", label: "Gemini 4 Argon" },
+	];
+	const runtimeState = {
+		disabledProviders: new Set(["claudeAgent"]),
+		hiddenModelsByProvider: new Map([["opencode", new Set(["opencode/glm-5.3"])]]),
+		favorites: new Set(["opencode:cloudflare-workers-ai/@cf/zai-org/glm-5.3"]),
+		modelOrder: new Map(),
+		connectedOpencodeSubproviders: new Set(["google", "cloudflare-workers-ai", "opencode"]),
+	};
+	const resolved = resolveModels(defaultConfig, catalog, null, runtimeState);
+	const ids = resolved.models.map((m) => m.id);
+	assert.ok(!ids.includes("claude-opus-5-5"), "skips disabled claudeAgent provider");
+	assert.ok(!ids.includes("opencode/glm-5.3"), "skips hidden opencode/glm-5.3");
+	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3"), "selects connected cloudflare-workers-ai glm-5.3");
+	assert.ok(!ids.includes("github-copilot/gemini-4-argon"), "skips unauthenticated github-copilot gateway");
+	assert.ok(ids.includes("google/gemini-4-argon"), "includes connected google/gemini-4-argon");
+	assert.equal(resolved.recommended.crossFamilyReviewer.id, "google/gemini-4-argon", "falls back reviewer to Gemini 4 Argon when Claude is disabled");
 });
 
 test("gracefully falls back to single harness (claude-only or codex-only)", () => {
