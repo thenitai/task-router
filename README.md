@@ -113,7 +113,7 @@ By default, the skill reads `model.json` in the skill folder (`~/.agents/skills/
     "claude:all",
     "claude:!fable",
 
-    "opencode:gemini-4*, gemini-3.8*, glm-5.3*, kimi-k3, deepseek-v4*"
+    "opencode:glm-5.3*, kimi-k3, deepseek-v4*"
   ],
   "reasoning": {
     "coordinator": "medium",
@@ -170,7 +170,7 @@ By default, the skill reads `model.json` in the skill folder (`~/.agents/skills/
     "codex:!luna",
     "claude:all",
     "claude:!fable",
-    "opencode:gemini-4*, gemini-3.8*, glm-5.3*, kimi-k3, deepseek-v4*"
+    "opencode:glm-5.3*, kimi-k3, deepseek-v4*"
   ],
   "reasoning": {
     "coordinator": "medium",

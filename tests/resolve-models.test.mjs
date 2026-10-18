@@ -21,8 +21,8 @@ test("default model.json resolves expected models and excludes claude-fable and 
 	assert.ok(!ids.includes("gpt-6-sol"), "excludes superseded gpt-6-sol via latestGenerationOnly");
 	assert.ok(!ids.includes("gpt-5.6-sol"), "excludes legacy gpt-5.6-sol");
 	assert.ok(!ids.includes("claude-opus-4-8"), "excludes legacy claude-opus-4-8");
-	assert.ok(ids.includes("google/gemini-4-argon"), "includes google/gemini-4-argon");
-	assert.ok(ids.includes("opencode/gemini-3.8-flash"), "includes opencode/gemini-3.8-flash");
+	assert.ok(!ids.includes("google/gemini-4-argon"), "excludes google/gemini-4-argon after removing gemini from model.json");
+	assert.ok(!ids.includes("opencode/gemini-3.8-flash"), "excludes opencode/gemini-3.8-flash after removing gemini from model.json");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3"), "includes cloudflare-workers-ai glm-5.3");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash"), "includes cloudflare-workers-ai glm-5.3-flash");
 	assert.ok(ids.includes("opencode/kimi-k3"), "includes opencode/kimi-k3");
@@ -97,8 +97,41 @@ test("skips disabled T3 providers and respects hiddenModels + connected OpenCode
 	assert.ok(!ids.includes("opencode/glm-5.3"), "skips hidden opencode/glm-5.3");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3"), "selects connected cloudflare-workers-ai glm-5.3");
 	assert.ok(!ids.includes("github-copilot/gemini-4-argon"), "skips unauthenticated github-copilot gateway");
-	assert.ok(ids.includes("google/gemini-4-argon"), "includes connected google/gemini-4-argon");
-	assert.equal(resolved.recommended.crossFamilyReviewer.id, "google/gemini-4-argon", "falls back reviewer to Gemini 4 Argon when Claude is disabled");
+	assert.ok(!ids.includes("google/gemini-4-argon"), "excludes google/gemini-4-argon when not in select");
+	assert.equal(resolved.recommended.crossFamilyReviewer.id, "cloudflare-workers-ai/@cf/zai-org/glm-5.3", "falls back reviewer to cross-family OpenCode workhorse when Claude is disabled and Gemini is excluded");
+});
+
+test("uses post-reset window stats and does not throttle $200 OpenAI Pro plan when credits/resets remain", () => {
+	const runtimeState = {
+		disabledProviders: new Set(["claudeAgent"]),
+		hiddenModelsByProvider: new Map(),
+		favorites: new Set(),
+		modelOrder: new Map(),
+		connectedOpencodeSubproviders: new Set(["cloudflare-workers-ai", "opencode"]),
+		usage: {
+			byProvider: {
+				codex: { usd7d: 702.78, usdWindow: 152.34, tokens7d: 1_070_100_000, tokensWindow: 119_300_000, turns7d: 5000, usdTotal: 702.78, tokensTotal: 1_070_100_000, turnsTotal: 5000 },
+			},
+			liveRateLimits: {
+				codex: {
+					planType: "pro",
+					usedPercent: 49,
+					windowMinutes: 10080,
+					resetsAtSec: 1792875416,
+					windowStartMs: (1792875416 - 10080 * 60) * 1000,
+					hasCredits: true,
+					creditsBalance: 30173.67,
+					rateLimitReached: false,
+				},
+			},
+		},
+	};
+	const resolved = resolveModels(defaultConfig, undefined, null, runtimeState);
+	assert.equal(resolved.quotaStatus.codex.percentUsed, 49, "reports live post-reset 49% used instead of stale 100%");
+	assert.equal(resolved.quotaStatus.codex.spent7dUsd, 152.34, "uses post-reset window spend instead of pre-reset 7d sum");
+	assert.equal(resolved.quotaStatus.codex.tokens7dM, 119.3, "uses post-reset window tokens");
+	assert.equal(resolved.quotaStatus.codex.throttled, false, "does not throttle codex");
+	assert.equal(resolved.recommended.primaryImplementer.id, "gpt-6.1-sol", "keeps codex:gpt-6.1-sol as primary implementer");
 });
 
 test("gracefully falls back to single harness (claude-only or codex-only)", () => {

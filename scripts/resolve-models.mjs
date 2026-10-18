@@ -172,6 +172,76 @@ export function pickReasoning(desired, options = []) {
 	return options[0];
 }
 
+export function findLatestCodexRateLimits(homeDir = os.homedir(), fallbackFiles = [], nowMs = Date.now()) {
+	const walkJsonl = (dir, out = []) => {
+		if (!fs.existsSync(dir)) return out;
+		try {
+			for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+				const p = path.join(dir, ent.name);
+				if (ent.isDirectory()) walkJsonl(p, out);
+				else if (ent.name.endsWith(".jsonl")) out.push(p);
+			}
+		} catch {}
+		return out;
+	};
+
+	const candidates = new Set([
+		...walkJsonl(path.join(homeDir, ".codex", "sessions")),
+		...walkJsonl(path.join(homeDir, ".codex", "archived_sessions")),
+		...fallbackFiles.filter((f) => fs.existsSync(f)),
+	]);
+	if (candidates.size === 0) return null;
+
+	const scoredFiles = Array.from(candidates)
+		.map((filePath) => {
+			const base = path.basename(filePath);
+			const match = base.match(/rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})/);
+			const nameKey = match ? match[1] : "";
+			let mtimeMs = 0;
+			try {
+				mtimeMs = fs.statSync(filePath).mtimeMs;
+			} catch {}
+			return { filePath, nameKey, mtimeMs };
+		})
+		.sort((a, b) => b.nameKey.localeCompare(a.nameKey) || b.mtimeMs - a.mtimeMs)
+		.slice(0, 15);
+
+	let best = null;
+	for (const { filePath } of scoredFiles) {
+		try {
+			const tail = fs.readFileSync(filePath, "utf8").trim().split("\n").slice(-50);
+			for (let i = tail.length - 1; i >= 0; i--) {
+				try {
+					const parsed = JSON.parse(tail[i]);
+					const rl = parsed?.payload?.rate_limits;
+					if (!rl?.primary) continue;
+					const eventTsMs = parsed.timestamp ? Date.parse(parsed.timestamp) || 0 : 0;
+					const resetsAtSec = rl.primary.resets_at || 0;
+					if (!best || eventTsMs > best.eventTsMs || (eventTsMs === best.eventTsMs && resetsAtSec > best.resetsAtSec)) {
+						const windowMinutes = rl.primary.window_minutes || 10080;
+						const windowStartMs = resetsAtSec > 0 ? (resetsAtSec - windowMinutes * 60) * 1000 : null;
+						const expired = resetsAtSec > 0 && resetsAtSec * 1000 <= nowMs;
+						const rawBalance = parseFloat(rl.credits?.balance ?? "0");
+						best = {
+							planType: rl.plan_type || "pro",
+							usedPercent: expired ? 0 : rl.primary.used_percent,
+							windowMinutes,
+							resetsAtSec,
+							windowStartMs,
+							hasCredits: Boolean(rl.credits?.has_credits),
+							creditsBalance: Number.isNaN(rawBalance) ? 0 : Number(rawBalance.toFixed(2)),
+							rateLimitReached: Boolean(rl.rate_limit_reached_type || rl.spend_control_reached),
+							eventTsMs,
+						};
+					}
+					break;
+				} catch {}
+			}
+		} catch {}
+	}
+	return best;
+}
+
 export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 	const usagePath = path.join(homeDir, ".t3", "userdata", "usage-scan-cache-v5.json");
 	const sevenDaysAgo = nowMs - 7 * 86400 * 1000;
@@ -179,16 +249,21 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 	const byProvider = {};
 	const byModel = {};
 	const liveRateLimits = {};
+	const existingCodexFiles = [];
 
 	if (fs.existsSync(usagePath)) {
 		try {
 			const data = JSON.parse(fs.readFileSync(usagePath, "utf8"));
-			const existingCodexFiles = [];
-
 			for (const [filePath, fileEntry] of Object.entries(data.files || {})) {
+				if (fileEntry.p === "codex" && fs.existsSync(filePath)) existingCodexFiles.push(filePath);
+			}
+			const codexLive = findLatestCodexRateLimits(homeDir, existingCodexFiles, nowMs);
+			if (codexLive) liveRateLimits.codex = codexLive;
+			const codexWindowStartMs = codexLive?.windowStartMs ? Math.max(sevenDaysAgo, codexLive.windowStartMs) : sevenDaysAgo;
+
+			for (const [, fileEntry] of Object.entries(data.files || {})) {
 				const rawProv = fileEntry.p || "unknown";
 				const prov = rawProv === "claude" ? "claudeAgent" : rawProv;
-				if (prov === "codex" && fs.existsSync(filePath)) existingCodexFiles.push(filePath);
 
 				for (const row of fileEntry.r || []) {
 					const [ts, mIdx, , inTok = 0, cacheRead = 0, , outTok = 0] = row;
@@ -198,7 +273,7 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 					const turnCostUsd = (inTok / 1e6) * (rates.input || 0) + (cacheRead / 1e6) * (rates.cacheRead || 0) + (outTok / 1e6) * (rates.output || 0);
 					const totalTokens = (inTok || 0) + (cacheRead || 0) + (outTok || 0);
 
-					if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokens30d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turns30d: 0, turnsTotal: 0 };
+					if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usdWindow: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensWindow: 0, tokens30d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turns30d: 0, turnsTotal: 0 };
 					byProvider[prov].usdTotal += turnCostUsd;
 					byProvider[prov].tokensTotal += totalTokens;
 					byProvider[prov].turnsTotal += 1;
@@ -214,6 +289,11 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 						byProvider[prov].cacheRead7d += cacheRead || 0;
 						byProvider[prov].outTok7d += outTok || 0;
 						byProvider[prov].turns7d += 1;
+					}
+					const windowCutoff = prov === "codex" ? codexWindowStartMs : sevenDaysAgo;
+					if (ts >= windowCutoff) {
+						byProvider[prov].usdWindow += turnCostUsd;
+						byProvider[prov].tokensWindow += totalTokens;
 					}
 
 					const mKey = `${prov}:${modelSlug}`;
@@ -232,25 +312,10 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 					}
 				}
 			}
-
-			if (existingCodexFiles.length > 0) {
-				const latestFile = existingCodexFiles[existingCodexFiles.length - 1];
-				const tail = fs.readFileSync(latestFile, "utf8").trim().split("\n").slice(-30);
-				for (let i = tail.length - 1; i >= 0; i--) {
-					try {
-						const parsed = JSON.parse(tail[i]);
-						if (parsed?.payload?.rate_limits?.primary) {
-							liveRateLimits.codex = {
-								planType: parsed.payload.rate_limits.plan_type || "pro",
-								usedPercent: parsed.payload.rate_limits.primary.used_percent,
-								resetsAtSec: parsed.payload.rate_limits.primary.resets_at,
-							};
-							break;
-						}
-					} catch {}
-				}
-			}
 		} catch {}
+	} else {
+		const codexLive = findLatestCodexRateLimits(homeDir, [], nowMs);
+		if (codexLive) liveRateLimits.codex = codexLive;
 	}
 
 	const ocDbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
@@ -458,21 +523,26 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 
 	const throttledProviders = new Set();
 	const quotaStatus = {};
+	const subProviders = Object.keys(budgetCfg.weeklyLimitUsdEquivalent || {});
+	const enabledSubProviders = subProviders.filter((p) => !runtimeState?.disabledProviders?.has(p));
 	for (const [prov, rawLimit] of Object.entries(budgetCfg.weeklyLimitUsdEquivalent || {})) {
-		const spent7d = runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0;
-		const tokens7d = runtimeState?.usage?.byProvider?.[prov]?.tokens7d ?? 0;
 		const isTokenLimit = typeof rawLimit === "string" && /[mk]$/i.test(rawLimit.trim());
+		const liveLimit = runtimeState?.usage?.liveRateLimits?.[prov];
+		const useWindowStats = Boolean(!isTokenLimit && liveLimit?.windowStartMs && runtimeState?.usage?.byProvider?.[prov]?.usdWindow !== undefined && !options.weeklyLimits?.[prov]);
+		const spent7d = useWindowStats ? runtimeState.usage.byProvider[prov].usdWindow : (runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0);
+		const tokens7d = useWindowStats ? runtimeState.usage.byProvider[prov].tokensWindow : (runtimeState?.usage?.byProvider?.[prov]?.tokens7d ?? 0);
 		const limitVal = isTokenLimit ? (rawLimit.toLowerCase().endsWith("m") ? parseFloat(rawLimit) * 1e6 : parseFloat(rawLimit) * 1e3) : Number(String(rawLimit).replace(/^\$/, ""));
 		const currentVal = isTokenLimit ? tokens7d : spent7d;
 		let pct = limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : 0;
 
-		const liveLimit = runtimeState?.usage?.liveRateLimits?.[prov];
 		if (!isTokenLimit && liveLimit?.usedPercent !== undefined && plans[prov] === 200 && !options.weeklyLimits?.[prov]) {
 			pct = liveLimit.usedPercent;
 		}
 
+		const hasCreditHeadroom = Boolean(liveLimit?.hasCredits && liveLimit?.creditsBalance > 0 && !liveLimit?.rateLimitReached && !options.weeklyLimits?.[prov] && !options.autoThrottle);
+		const isOnlyActiveSub = enabledSubProviders.length === 1 && enabledSubProviders[0] === prov && !options.weeklyLimits?.[prov] && !options.autoThrottle && !liveLimit?.rateLimitReached;
 		const overThreshold = pct >= budgetCfg.autoDowngradeAbovePercent;
-		const throttled = Boolean(budgetCfg.autoThrottle && overThreshold);
+		const throttled = Boolean(budgetCfg.autoThrottle && overThreshold && !hasCreditHeadroom && !isOnlyActiveSub);
 		if (throttled) throttledProviders.add(prov);
 		quotaStatus[prov] = {
 			planMonthlyUsd: plans[prov] || null,
@@ -482,6 +552,8 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 			weeklyLimit: rawLimit,
 			percentUsed: pct,
 			liveServerReported: Boolean(!isTokenLimit && liveLimit?.usedPercent !== undefined && plans[prov] === 200 && !options.weeklyLimits?.[prov]),
+			resetsAt: liveLimit?.resetsAtSec ? new Date(liveLimit.resetsAtSec * 1000).toISOString().slice(0, 10) : null,
+			creditsBalance: liveLimit?.creditsBalance || null,
 			overThreshold,
 			throttled,
 		};
@@ -609,8 +681,10 @@ export function formatMarkdown(resolved) {
 	if (Object.keys(resolved.quotaStatus || {}).length) {
 		const parts = Object.entries(resolved.quotaStatus).map(([prov, q]) => {
 			const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
-			const label = q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} 7d eq (${q.tokens7dM}M tok)`;
-			return `\`${prov}\` (${planTag}): ${label} -> **${q.percentUsed}% used**${q.throttled ? " **[THROTTLED]**" : ""}`;
+			const label = q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} eq (${q.tokens7dM}M tok)`;
+			const creditNote = q.creditsBalance ? `, ${Math.round(q.creditsBalance).toLocaleString("en-US")} credits/reset buffer` : "";
+			const resetNote = q.resetsAt ? `, resets ${q.resetsAt}` : "";
+			return `\`${prov}\` (${planTag}): ${label} -> **${q.percentUsed}% used**${creditNote}${resetNote}${q.throttled ? " **[THROTTLED]**" : ""}`;
 		});
 		lines.push(`- **7-Day Subscription Headroom:** ${parts.join(" | ")}`);
 	}
@@ -709,6 +783,8 @@ function loadConfig(customPath) {
 		customPath,
 		path.join(os.homedir(), ".config", "task-router", "model.json"),
 		path.join(os.homedir(), ".config", "task-router", "models.json"),
+		path.join(os.homedir(), ".codex", "task-router", "model.json"),
+		path.join(os.homedir(), ".codex", "task-router", "models.json"),
 		path.join(SKILL_ROOT, "model.json"),
 		path.join(SKILL_ROOT, "models.json"),
 	].filter(Boolean);
