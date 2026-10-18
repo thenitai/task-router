@@ -303,12 +303,17 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		coordinatorTier: config?.budget?.coordinatorTier || "workhorse",
 		preferSubscriptionOverApi: true,
 		blockApiSubproviders: ["openai", "anthropic"],
-		weeklyLimitUsdEquivalent: { codex: 45, claudeAgent: 45, ...(config?.budget?.weeklyLimitUsdEquivalent || {}), ...(options.weeklyLimits || {}) },
+		autoThrottle: options.autoThrottle ?? config?.budget?.autoThrottle ?? Boolean(options.weeklyLimits),
+		weeklyLimitUsdEquivalent: { codex: 250, claudeAgent: 250, ...(config?.budget?.weeklyLimitUsdEquivalent || {}), ...(options.weeklyLimits || {}) },
 		autoDowngradeAbovePercent: config?.budget?.autoDowngradeAbovePercent ?? 80,
 		...(config?.budget || {}),
 	};
 	if (options.budgetMode) budgetCfg.mode = options.budgetMode;
-	if (options.weeklyLimits) budgetCfg.weeklyLimitUsdEquivalent = { ...budgetCfg.weeklyLimitUsdEquivalent, ...options.weeklyLimits };
+	if (options.autoThrottle !== undefined) budgetCfg.autoThrottle = options.autoThrottle;
+	if (options.weeklyLimits) {
+		budgetCfg.weeklyLimitUsdEquivalent = { ...budgetCfg.weeklyLimitUsdEquivalent, ...options.weeklyLimits };
+		budgetCfg.autoThrottle = true;
+	}
 
 	const reasoningCfg = { coordinator: "medium", frontier: "high", workhorse: "medium", reviewer: "high", fast: "medium", ...(config?.reasoning || {}) };
 	const rulesByProvider = parseSelectRules(config?.select || []);
@@ -321,9 +326,10 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	for (const [prov, limitUsd] of Object.entries(budgetCfg.weeklyLimitUsdEquivalent || {})) {
 		const spent7d = runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0;
 		const pct = limitUsd > 0 ? Math.round((spent7d / limitUsd) * 100) : 0;
-		const throttled = pct >= budgetCfg.autoDowngradeAbovePercent;
+		const overThreshold = pct >= budgetCfg.autoDowngradeAbovePercent;
+		const throttled = Boolean(budgetCfg.autoThrottle && overThreshold);
 		if (throttled) throttledProviders.add(prov);
-		quotaStatus[prov] = { spent7dUsd: Number(spent7d.toFixed(2)), weeklyLimitUsd: limitUsd, percentUsed: pct, throttled };
+		quotaStatus[prov] = { spent7dUsd: Number(spent7d.toFixed(2)), weeklyLimitUsd: limitUsd, percentUsed: pct, overThreshold, throttled };
 	}
 
 	const filtered = enriched.filter((model) => {
@@ -504,6 +510,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const harnessIdx = args.indexOf("--harness");
 	const budgetIdx = args.indexOf("--budget");
 	const limitIdx = args.indexOf("--weekly-limit");
+	const autoThrottle = args.includes("--throttle") ? true : undefined;
 	const staticOnly = args.includes("--static");
 	const asJson = args.includes("--json");
 
@@ -514,6 +521,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const options = {
 		budgetMode: budgetIdx !== -1 ? args[budgetIdx + 1] : undefined,
 		weeklyLimits: limitIdx !== -1 ? parseLimitsArg(args[limitIdx + 1]) : undefined,
+		autoThrottle,
 	};
 
 	const resolved = resolveModels(config, catalogModels, activeHarnesses, runtimeState, options);

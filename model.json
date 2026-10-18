@@ -10,9 +10,10 @@
     "coordinatorTier": "workhorse",
     "preferSubscriptionOverApi": true,
     "blockApiSubproviders": ["openai", "anthropic"],
+    "autoThrottle": false,
     "weeklyLimitUsdEquivalent": {
-      "codex": 45,
-      "claudeAgent": 45
+      "codex": 250,
+      "claudeAgent": 250
     },
     "autoDowngradeAbovePercent": 80
   },
