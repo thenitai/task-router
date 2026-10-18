@@ -12,10 +12,10 @@ Cost-aware, adaptive multi-model planning and subagent orchestration skill for *
 
 ## Installation
 
-Install or update globally across all supported agents (`claude-code`, `codex`, `opencode`, T3 Code, etc.):
+Install or update globally across Claude Code, Codex, OpenCode, and T3 Code:
 
 ```fish
-npx skills add thenitai/task-router -g --all
+npx skills add thenitai/task-router -g -y -a claude-code codex opencode
 ```
 
 Invoke in your agent:
