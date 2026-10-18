@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { formatMarkdown, resolveModels } from "../scripts/resolve-models.mjs";
+import { formatMarkdown, formatUsageReport, planToWeeklyLimitUsd, resolveModels } from "../scripts/resolve-models.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultConfig = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "model.json"), "utf8"));
@@ -118,4 +118,40 @@ test("formatMarkdown renders markdown table and cost recommendations", () => {
 	const md = formatMarkdown(resolved);
 	assert.ok(md.includes("| `@frontier` |"));
 	assert.ok(md.includes("Recommended Cost-Optimized Routing"));
+});
+
+test("maps monthly plans (openai=200, claude=100) to weekly capacity and load-balances across subscriptions", () => {
+	assert.equal(planToWeeklyLimitUsd("codex", 200), 1750);
+	assert.equal(planToWeeklyLimitUsd("codex", 20), 175);
+	assert.equal(planToWeeklyLimitUsd("claudeAgent", 100), 450);
+	assert.equal(planToWeeklyLimitUsd("claudeAgent", 20), 90);
+
+	const runtimeState = {
+		disabledProviders: new Set(),
+		hiddenModelsByProvider: new Map(),
+		favorites: new Set(),
+		modelOrder: new Map(),
+		connectedOpencodeSubproviders: new Set(["google", "cloudflare-workers-ai", "opencode"]),
+		usage: {
+			byProvider: {
+				codex: { usd7d: 90, tokens7d: 150_000_000, inTok7d: 2_000_000, cacheRead7d: 147_000_000, outTok7d: 1_000_000, turns7d: 1000, usdTotal: 90, tokensTotal: 150_000_000, turnsTotal: 1000 },
+				claudeAgent: { usd7d: 20, tokens7d: 30_000_000, inTok7d: 500_000, cacheRead7d: 29_000_000, outTok7d: 500_000, turns7d: 200, usdTotal: 20, tokensTotal: 30_000_000, turnsTotal: 200 },
+			},
+			byModel: {
+				"codex:gpt-6.1-sol": { provider: "codex", model: "gpt-6.1-sol", billing: "subscription", usd7d: 90, usdTotal: 90, tokens7d: 150_000_000, tokensTotal: 150_000_000, inTok7d: 2_000_000, cacheRead7d: 147_000_000, outTok7d: 1_000_000, turns7d: 1000, turnsTotal: 1000 },
+			},
+			liveRateLimits: {},
+		},
+	};
+	const resolved = resolveModels(defaultConfig, undefined, null, runtimeState, { plans: { codex: 20, claudeAgent: 100 } });
+	assert.equal(resolved.quotaStatus.codex.weeklyLimit, 175);
+	assert.equal(resolved.quotaStatus.codex.percentUsed, 51);
+	assert.equal(resolved.quotaStatus.claudeAgent.weeklyLimit, 450);
+	assert.equal(resolved.quotaStatus.claudeAgent.percentUsed, 4);
+	assert.equal(resolved.recommended.primaryImplementer.providerInstanceId, "claudeAgent", "load-balances toward claudeAgent (4% used) over codex (51% used)");
+	assert.equal(resolved.recommended.secondaryImplementer.providerInstanceId, "codex", "keeps codex as secondary parallel implementer");
+
+	const report = formatUsageReport(runtimeState, resolved);
+	assert.ok(report.includes("Subscription Plan Simulator"));
+	assert.ok(report.includes("openai=20, claude=100"));
 });

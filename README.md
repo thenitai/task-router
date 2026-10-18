@@ -4,21 +4,15 @@ Cost-aware, adaptive multi-model planning and subagent orchestration skill for *
 
 `task-router` replaces hardcoded model names in planning prompts with a dynamic resolver (`scripts/resolve-models.mjs`) backed by `model.json` and your live local runtime settings:
 1. **Resolves active models and gateways** from your live installations (`codex`, `claudeAgent`, `opencode`), skipping disabled T3 providers, hidden models, and unauthenticated gateways.
-2. **Protects subscriptions over paid APIs** by prioritizing direct subscriptions (`codex`, `claudeAgent`) and blocking duplicate per-token API charges (`openai/*`, `anthropic/*` inside OpenCode).
-3. **Tracks 7-day rolling usage & spend** from T3 telemetry (`~/.t3/userdata/usage-scan-cache-v5.json`) in both **API-equivalent USD ($)** and **token volume (`M`/`k`)**.
-4. **Enforces a 3-phase workflow**: Read-only investigation & cost-optimized routing table → explicit user approval gate → autonomous subagent implementation, cross-family code review, frontend browser testing, and git integration.
+2. **Understands your monthly subscription plans (`openai=200, claude=100`)**, reads live server-reported quota % from Codex session logs, and **automatically spreads work across subscriptions** toward whichever provider has more remaining weekly headroom.
+3. **Protects subscriptions over paid APIs** by prioritizing direct subscriptions (`codex`, `claudeAgent`) and blocking duplicate per-token API charges (`openai/*`, `anthropic/*` inside OpenCode).
+4. **Generates Usage, Cost & Subscription ROI Reports (`--report`)** across T3 (`~/.t3/userdata/usage-scan-cache-v5.json`) and OpenCode (`~/.local/share/opencode/opencode.db`), including a **Plan Simulator** comparing `$200`, `$120 ($20+$100)`, `$40 ($20+$20)`, and pay-per-token Google API.
 
 ---
 
 ## Installation
 
-Install globally across all supported agents (`claude-code`, `codex`, `opencode`, T3 Code, etc.):
-
-```fish
-npx skills add thenitai/task-router -g --all
-```
-
-Update to the latest version:
+Install or update globally across all supported agents (`claude-code`, `codex`, `opencode`, T3 Code, etc.):
 
 ```fish
 npx skills add thenitai/task-router -g --all
@@ -30,44 +24,58 @@ Invoke in your agent:
 
 ---
 
-## How `--weekly-limit` Works (Price vs. Tokens)
+## Setting Your Subscription Plans (`plans` & `--plan`)
 
-Subscription plans (like OpenAI Pro/Plus and Claude Max/Pro) do not expose a live "remaining dollars" API endpoint; instead, they meter your rolling 7-day usage internally, weighting frontier models much more heavily than smaller models.
+Instead of guessing weekly token or dollar limits, you simply declare your monthly subscription tiers in `model.json` (or via `--plan`):
 
-To mirror that accurately, `task-router` reads every turn recorded in `~/.t3/userdata/usage-scan-cache-v5.json` over the past 7 days and supports **two limit formats**:
+```json
+"plans": {
+  "openai": 200,
+  "claude": 100
+}
+```
 
-### 1. API-Equivalent USD Price (Default — Number or `$`)
-Computes what your rolling 7-day uncached input, cached input, and output tokens would cost at each model's per-million token rate (`~/.cache/opencode/models.json`):
-- **Why this is the default:** 10M cached tokens on `gpt-6-astra` ($1.00/M = **$10.00**) drains your subscription window **10x faster** than 10M cached tokens on `gpt-6.1-sol` ($0.10/M = **$1.00**), and **100x faster** than `gpt-6-luna` ($0.01/M = **$0.10**). Weighting by price captures the real quota impact of frontier vs. workhorse models.
-- **Example (`model.json`):**
-  ```json
-  "weeklyLimitUsdEquivalent": {
-    "codex": 250,
-    "claudeAgent": 250
-  }
-  ```
-- **Example (CLI flag):**
-  ```fish
-  node ~/.agents/skills/task-router/scripts/resolve-models.mjs --weekly-limit codex=150,claude=200
-  ```
+Or on the CLI:
 
-### 2. Raw Token Count (`M` or `k` Suffix)
-If you prefer to cap by raw 7-day token volume (uncached input + cached input + output tokens combined), pass a string ending in `M` (millions) or `k` (thousands):
-- **Example (`model.json`):**
-  ```json
-  "weeklyLimitUsdEquivalent": {
-    "codex": "500M",
-    "claudeAgent": "400M"
-  }
-  ```
-- **Example (CLI flag):**
-  ```fish
-  node ~/.agents/skills/task-router/scripts/resolve-models.mjs --weekly-limit codex=500M,claude=400M
-  ```
+```fish
+node ~/.agents/skills/task-router/scripts/resolve-models.mjs --plan openai=20,claude=100
+```
 
-In both modes, the status header displays **both** metrics side-by-side:
+### How Monthly Plans Map to Weekly Capacity & Load-Balancing
+
+| Provider | Monthly Plan (`plans`) | Weekly API-Equivalent Capacity | How Usage % Is Calculated |
+| :--- | :--- | :--- | :--- |
+| **OpenAI (`codex`)** | `200` (Pro $200/mo)<br>`20` (Plus $20/mo) | **~$1,750 / week eq**<br>**~$175 / week eq** | Reads OpenAI's **live server-reported `used_percent`** directly from your latest Codex rollout log (`~/.codex/sessions/...`) when on Pro, or divides your rolling 7-day token cost by the plan's weekly capacity. |
+| **Anthropic (`claude`)** | `200` (Max 20x $200/mo)<br>`100` (Max 5x $100/mo)<br>`20` (Pro $20/mo) | **~$1,500 / week eq**<br>**~$450 / week eq**<br>**~$90 / week eq** | Divides your rolling 7-day Claude token cost (`~/.t3/userdata/usage-scan-cache-v5.json`) by the plan's weekly capacity. |
+
+When `"spreadAcrossSubscriptions": true` (default):
+- If `codex` is at `44% used` and `claudeAgent` is at `5% used`, the router **automatically promotes `claudeAgent` (`claude-sonnet-5-5`) as Primary Implementer/Coordinator** and assigns `codex` (`gpt-6.1-sol`) to Secondary Parallel Slices until both subscriptions balance out.
+- If either provider reaches `autoDowngradeAbovePercent` (default `80%`), it is marked `THROTTLED` and demoted behind your other subscription and cheap Cloudflare Workers AI models (`deepseek-v4-pro-0813`, `glm-5.3`).
+
+---
+
+## Pulling a Usage, Cost & Plan ROI Report (`--report`)
+
+Run `--report` at any time to inspect your 7-day and all-time usage across every model (both subscription and paid OpenCode API) and see which subscription combination best fits your actual workload:
+
+```fish
+node ~/.agents/skills/task-router/scripts/resolve-models.mjs --report
+```
+
+Example output:
 ```text
-- 7-Day Rolling Quota Burn: `codex`: $702.78 / $250 7d eq (551.1M tok) (281%) | `claudeAgent`: $0.88 / $250 7d eq (2.3M tok) (0%)
+## Task-Router Usage, Cost & Subscription ROI Report
+
+### 1. Per-Model Breakdown (Rolling 7 Days & All-Time)
+| Provider | Model | Billing | 7d Turns (% Share) | 7d Tokens (In / Cache / Out) | 7d Cost / API-Eq (% Share) | All-Time Cost / Eq |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `codex` | `gpt-6-astra` | `subscription` | 4230 (53%) | 487.0M (8.8M / 477.2M / 1.04M) | $616.68 sub-eq (88%) | $733.13 |
+| `codex` | `gpt-6.1-sol` | `subscription` | 3596 (45%) | 577.3M (7.6M / 568.3M / 1.39M) | $86.00 sub-eq (12%) | $89.26 |
+| `opencode` | `google/gemini-3.8-flash` | `api` | 0 (0%) | 0.0M | $0.00 billed (0%) | $18.93 |
+
+### 2. Subscription Plan Simulator (Based on Your Actual 7-Day Workload)
+- Current 7d Codex burn (with Astra as Coordinator): $702.78/wk eq (Server-reported: 44% of $200 Pro weekly limit)
+- Optimized 7d burn (replacing Astra Coordinator with `gpt-6.1-sol` / `claude-sonnet-5-5`): $161.71/wk eq (-77% quota burn for the exact same 1072M tokens!)
 ```
 
 ---
@@ -86,16 +94,17 @@ By default, the skill reads `model.json` in the skill folder (`~/.agents/skills/
     "crossFamilyReview": true,
     "respectRuntimeSettings": true
   },
+  "plans": {
+    "openai": 200,
+    "claude": 100
+  },
   "budget": {
     "mode": "balanced",
     "coordinatorTier": "workhorse",
     "preferSubscriptionOverApi": true,
+    "spreadAcrossSubscriptions": true,
     "blockApiSubproviders": ["openai", "anthropic"],
-    "autoThrottle": false,
-    "weeklyLimitUsdEquivalent": {
-      "codex": 250,
-      "claudeAgent": 250
-    },
+    "autoThrottle": true,
     "autoDowngradeAbovePercent": 80
   },
   "select": [
@@ -118,111 +127,83 @@ By default, the skill reads `model.json` in the skill folder (`~/.agents/skills/
 
 ---
 
-### 1. `defaults` Settings & Examples
+### 1. `plans` Settings & Examples
 
 | Setting | Type | Default | Description & Example |
 | :--- | :--- | :--- | :--- |
-| `latestGenerationOnly` | `boolean` | `true` | Automatically drops superseded model generations (`gpt-5.6-*`, `gpt-6-sol` when `gpt-6.1-sol` is present, `claude-opus-4-8`, `claude-opus-5` when `claude-opus-5-5` is present).<br>**Example:** Set `"latestGenerationOnly": false` if you explicitly want to test against legacy `gpt-5.6-sol` or `claude-opus-4-8`. |
-| `preferDirectProvider` | `boolean` | `true` | Deduplicates identical models across providers and gateways, preferring direct `codex` / `claudeAgent` first, then your T3 `favorites` and `modelOrder` (e.g., picking `cloudflare-workers-ai/@cf/zai-org/glm-5.3` over `opencode/glm-5.3-free`).<br>**Example:** Set `"preferDirectProvider": false` to list every gateway variant of the same model in the routing table. |
-| `crossFamilyReview` | `boolean` | `true` | Ensures the independent `@reviewer` uses a **different model family** from the primary implementer whenever multiple families are active (e.g., `claude-opus-5-5` or `google/gemini-4-argon` reviewing `gpt-6.1-sol`).<br>**Example:** Set `"crossFamilyReview": false` if you want the highest-ranked reviewer regardless of whether it matches the implementer's vendor. |
-| `respectRuntimeSettings` | `boolean` | `true` | Reads `~/.t3/userdata/settings.json` and `~/.local/share/opencode/auth.json` so disabled T3 providers (e.g., `claudeAgent.enabled: false`), `hiddenModels`, and unauthenticated OpenCode gateways (`github-copilot`, `amazon-bedrock`) are skipped automatically.<br>**Example:** Set `"respectRuntimeSettings": false` (or pass `--static`) to resolve against the static catalog ignoring local T3 settings. |
+| `openai` | `number` (`20` \| `200`) | `200` | Monthly OpenAI subscription tier in USD (`200` for Pro, `20` for Plus). Automatically sets `codex` weekly capacity (`$1,750/wk eq` for `$200`, `$175/wk eq` for `$20`).<br>**Example:** `"openai": 20` |
+| `claude` | `number` (`20` \| `100` \| `200`) | `100` | Monthly Anthropic Claude subscription tier in USD (`200` for Max 20x, `100` for Max 5x, `20` for Pro). Automatically sets `claudeAgent` weekly capacity (`$1,500/wk eq`, `$450/wk eq`, `$90/wk eq`).<br>**Example:** `"claude": 100` |
 
 ---
 
-### 2. `budget` Settings & Examples
+### 2. `defaults` Settings & Examples
 
 | Setting | Type | Default | Description & Example |
 | :--- | :--- | :--- | :--- |
-| `mode` | `"balanced" \| "economy" \| "performance"` | `"balanced"` | Controls how models are ranked inside each tier:<br>• `"balanced"` — Subscription `@workhorse` (`gpt-6.1-sol` / `claude-sonnet-5-5`) as Coordinator & primary implementer; `@fast` & open-weight models for recon/boilerplate.<br>• `"economy"` — Sorts every tier strictly by lowest $/M token cost (`deepseek-v4-pro-0813` and `glm-5.3` first for workhorse; `gpt-6-luna` / `glm-5.3-flash` first for fast; lowers workhorse reasoning to `low`/`medium`).<br>• `"performance"` — Promotes `@frontier` (`claude-opus-5-5`, `gpt-6-astra`) to the top of coordinator and review pools.<br>**Example:** `"mode": "economy"` when conserving subscription quota at the end of a billing cycle. |
+| `latestGenerationOnly` | `boolean` | `true` | Automatically drops superseded model generations (`gpt-5.6-*`, `gpt-6-sol` when `gpt-6.1-sol` is present, `claude-opus-4-8`, `claude-opus-5` when `claude-opus-5-5` is present).<br>**Example:** Set `"latestGenerationOnly": false` to include legacy models. |
+| `preferDirectProvider` | `boolean` | `true` | Deduplicates identical models across providers and gateways, preferring direct `codex` / `claudeAgent` first, then your T3 `favorites` and `modelOrder` (e.g., picking `cloudflare-workers-ai/@cf/zai-org/glm-5.3` over `opencode/glm-5.3-free`).<br>**Example:** `"preferDirectProvider": true` |
+| `crossFamilyReview` | `boolean` | `true` | Ensures the independent `@reviewer` uses a **different model family** from the primary implementer whenever multiple families are active (e.g., `claude-opus-5-5` or `google/gemini-4-argon` reviewing `gpt-6.1-sol`).<br>**Example:** `"crossFamilyReview": true` |
+| `respectRuntimeSettings` | `boolean` | `true` | Reads `~/.t3/userdata/settings.json` and `~/.local/share/opencode/auth.json` so disabled T3 providers (e.g., `claudeAgent.enabled: false`), `hiddenModels`, and unauthenticated OpenCode gateways (`github-copilot`, `amazon-bedrock`) are skipped automatically.<br>**Example:** Set `"respectRuntimeSettings": false` (or pass `--static`) to ignore local T3 state. |
+
+---
+
+### 3. `budget` Settings & Examples
+
+| Setting | Type | Default | Description & Example |
+| :--- | :--- | :--- | :--- |
+| `mode` | `"balanced" \| "economy" \| "performance"` | `"balanced"` | Controls how models are ranked inside each tier:<br>• `"balanced"` — Subscription `@workhorse` (`gpt-6.1-sol` / `claude-sonnet-5-5`) as Coordinator & primary implementer; `@fast` & open-weight models for recon/boilerplate.<br>• `"economy"` — Sorts every tier strictly by lowest $/M token cost (`deepseek-v4-pro-0813` and `glm-5.3` first for workhorse; `gpt-6-luna` / `glm-5.3-flash` first for fast; lowers workhorse reasoning to `low`/`medium`).<br>• `"performance"` — Promotes `@frontier` (`claude-opus-5-5`, `gpt-6-astra`) to the top of coordinator and review pools.<br>**Example:** `"mode": "economy"` |
 | `coordinatorTier` | `"workhorse" \| "frontier"` | `"workhorse"` | Selects the tier used for the main Coordinator session. Keeping this as `"workhorse"` (`gpt-6.1-sol` or `claude-sonnet-5-5`) saves **~8–10x cached-token burn** compared to running `gpt-6-astra` as Coordinator.<br>**Example:** `"coordinatorTier": "workhorse"` |
-| `preferSubscriptionOverApi` | `boolean` | `true` | In `"balanced"` mode, ranks flat-rate `subscription` providers (`codex`, `claudeAgent`) ahead of per-token `api` gateways (`opencode`) within the same tier.<br>**Example:** Set `"preferSubscriptionOverApi": false` to rank purely by $/M token price even in `"balanced"` mode. |
-| `blockApiSubproviders` | `string[]` | `["openai", "anthropic"]` | Prevents OpenCode from routing through paid per-token API keys for vendors you already cover via direct subscriptions (`openai/*`, `anthropic/*`).<br>**Example:** Remove `"anthropic"` (`"blockApiSubproviders": ["openai"]`) if you do not have a Claude subscription and want to use `anthropic/claude-sonnet-5-5` via your OpenCode API key. |
-| `autoThrottle` | `boolean` | `false` | When `true` (or when `--throttle` / `--weekly-limit` is passed on the CLI), any provider whose 7-day rolling usage exceeds `autoDowngradeAbovePercent` of `weeklyLimitUsdEquivalent` is marked `THROTTLED` and demoted behind unthrottled subscriptions and cheap open-weight models.<br>**Example:** Set `"autoThrottle": true` to automatically shift tasks from OpenAI (`codex`) to Claude (`claudeAgent`) or Cloudflare Workers AI once OpenAI hits 80% of its weekly target. |
-| `weeklyLimitUsdEquivalent` | `Record<string, number \| string>` | `{"codex": 250, "claudeAgent": 250}` | Weekly rolling 7-day target per provider, either in API-equivalent USD (`250` or `"$250"`) or raw tokens (`"500M"`).<br>**Example:** `{"codex": 150, "claudeAgent": 250}` after downgrading your OpenAI plan and adding a Claude subscription. |
-| `autoDowngradeAbovePercent` | `number` | `80` | Percentage of `weeklyLimitUsdEquivalent` at which a provider is considered over threshold (`overThreshold: true`, and throttled when `autoThrottle: true`).<br>**Example:** `"autoDowngradeAbovePercent": 75` |
+| `preferSubscriptionOverApi` | `boolean` | `true` | In `"balanced"` mode, ranks flat-rate `subscription` providers (`codex`, `claudeAgent`) ahead of per-token `api` gateways (`opencode`) within the same tier.<br>**Example:** `"preferSubscriptionOverApi": true` |
+| `spreadAcrossSubscriptions` | `boolean` | `true` | Dynamically load-balances between `codex` and `claudeAgent` based on which subscription has lower 7-day % usage (when they differ by ≥10%).<br>**Example:** `"spreadAcrossSubscriptions": true` |
+| `blockApiSubproviders` | `string[]` | `["openai", "anthropic"]` | Prevents OpenCode from routing through paid per-token API keys for vendors you already cover via direct subscriptions (`openai/*`, `anthropic/*`).<br>**Example:** `"blockApiSubproviders": ["openai", "anthropic"]` |
+| `autoThrottle` | `boolean` | `true` | Automatically marks any provider whose 7-day rolling usage exceeds `autoDowngradeAbovePercent` as `THROTTLED` and shifts primary tasks to unthrottled subscriptions or cheap open-weight models.<br>**Example:** `"autoThrottle": true` |
+| `weeklyLimitUsdEquivalent` | `Record<string, number \| string>` | *(Derived from `plans`)* | Optional custom override for weekly rolling 7-day capacity per provider, either in API-equivalent USD (`250` or `"$250"`) or raw tokens (`"300M"`).<br>**Example:** `{"codex": "300M", "claudeAgent": "400M"}` |
+| `autoDowngradeAbovePercent` | `number` | `80` | Percentage of weekly capacity at which a provider is throttled.<br>**Example:** `"autoDowngradeAbovePercent": 80` |
 
 ---
 
-### 3. `select` Rules & Examples
-
-Each entry in `select` is `<provider>:<comma-separated-rules>`.
-Supported provider names:
-- `codex` (alias `openai`) — Direct OpenAI Codex subscription provider
-- `claude` (aliases `anthropic`, `claudeAgent`) — Direct Anthropic Claude subscription provider
-- `opencode` (alias `google`) — OpenCode connected sub-providers (`google`, `cloudflare-workers-ai`, `cloudflare-ai-gateway`, `opencode`, etc.)
-
-#### Rule Examples
-
-1. **Include all current-generation models from OpenAI and Claude, excluding specific models (`!pattern`):**
-   ```json
-   "select": [
-     "codex:all",
-     "codex:!luna",
-     "claude:all",
-     "claude:!fable"
-   ]
-   ```
-   *(Note: Separate lines for the same provider merge automatically—`["codex:all", "codex:!luna"]` is identical to `["codex:all, !luna"]`.)*
-
-2. **Include only specific open-weight and Gemini models from OpenCode:**
-   ```json
-   "select": [
-     "opencode:gemini-4*, gemini-3.8*, glm-5.3*, kimi-k3, deepseek-v4*"
-   ]
-   ```
-
-3. **Claude-only setup:**
-   ```json
-   "select": [
-     "claude:all",
-     "claude:!fable"
-   ]
-   ```
-
----
-
-### 4. `reasoning` Settings & Examples
-
-Sets the default reasoning effort requested for each role/tier (automatically clamped to each model's supported options, e.g., `low`, `medium`, `high`, `xhigh`, `max`):
+### 4. `select` & `reasoning` Examples
 
 ```json
-"reasoning": {
-  "coordinator": "medium",
-  "frontier": "high",
-  "workhorse": "medium",
-  "reviewer": "high",
-  "fast": "medium"
-}
+  "select": [
+    "codex:all",
+    "codex:!luna",
+    "claude:all",
+    "claude:!fable",
+    "opencode:gemini-4*, gemini-3.8*, glm-5.3*, kimi-k3, deepseek-v4*"
+  ],
+  "reasoning": {
+    "coordinator": "medium",
+    "frontier": "high",
+    "workhorse": "medium",
+    "reviewer": "high",
+    "fast": "medium"
+  }
 ```
-
-- If a model only supports `["low", "high", "max"]` (such as `cloudflare-workers-ai/@cf/zai-org/glm-5.3` or `deepseek-v4-pro-0813`), requesting `"medium"` automatically resolves to `"high"`.
 
 ---
 
 ## CLI Usage & Flags (`scripts/resolve-models.mjs`)
 
-Run the resolver directly to inspect your active model pool, connected gateways, and 7-day quota burn:
-
 ```fish
 # Default (reads model.json + live T3 settings, OpenCode auth, and 7d usage telemetry)
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs
 
-# Force Economy mode (ranks cheapest $/M models like DeepSeek V4 Pro & GLM 5.3 first)
-node ~/.agents/skills/task-router/scripts/resolve-models.mjs --budget economy
+# Show full 7-day & all-time Usage, Cost & Plan Simulator Report
+node ~/.agents/skills/task-router/scripts/resolve-models.mjs --report
 
-# Force Performance mode (promotes frontier Opus 5.5 & GPT-6-Astra)
+# Simulate or apply specific monthly subscription plans ($20, $100, $200)
+node ~/.agents/skills/task-router/scripts/resolve-models.mjs --plan openai=20,claude=100
+
+# Force Economy or Performance mode
+node ~/.agents/skills/task-router/scripts/resolve-models.mjs --budget economy
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --budget performance
 
-# Enable automatic throttling with custom 7-day USD-equivalent caps
+# Override weekly limits by USD-equivalent or raw token count (M / k)
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --weekly-limit codex=150,claude=250
-
-# Enable automatic throttling with raw 7-day token caps (Millions of tokens)
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --weekly-limit codex=300M,claude=400M
 
-# Enable throttling using the limits already in model.json
-node ~/.agents/skills/task-router/scripts/resolve-models.mjs --throttle
-
-# Restrict to a single harness (e.g., standalone Codex or standalone Claude Code)
+# Restrict to a single harness (standalone Codex or Claude Code)
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --harness codex
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --harness claude
 

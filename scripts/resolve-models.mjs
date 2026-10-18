@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,10 +18,23 @@ const PROVIDER_ALIASES = {
 	google: "opencode",
 };
 
+export const PLAN_WEEKLY_CAPACITY_USD = {
+	codex: { 20: 175, 200: 1750 },
+	claudeAgent: { 20: 90, 100: 450, 200: 1500 },
+};
+
+export function planToWeeklyLimitUsd(providerInstanceId, monthlyPlanUsd) {
+	const num = Number(String(monthlyPlanUsd).replace(/^\$/, ""));
+	if (!num || Number.isNaN(num) || num <= 0) return 0;
+	const table = PLAN_WEEKLY_CAPACITY_USD[providerInstanceId];
+	if (table && table[num]) return table[num];
+	return providerInstanceId === "codex" ? Math.round(num * 8.75) : Math.round(num * 4.5);
+}
+
 export const CANONICAL_MODELS = [
-	{ providerInstanceId: "codex", id: "gpt-6-astra", label: "GPT-6-Astra", family: "openai", billing: "subscription", cost: { input: 10, output: 50, cacheRead: 1 }, tiers: ["frontier"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Heavy frontier (5x Sol quota burn) — reserve for bounded hard slices/review, avoid as coordinator" },
-	{ providerInstanceId: "codex", id: "gpt-6.1-sol", label: "GPT-6.1-Sol", family: "openai", billing: "subscription", cost: { input: 2, output: 10, cacheRead: 0.1 }, tiers: ["workhorse", "long_context"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Primary subscription workhorse (500k context, 0.10/M cache read) — ideal Coordinator & Integrator" },
-	{ providerInstanceId: "codex", id: "gpt-6-luna", label: "GPT-6-Luna", family: "openai", billing: "subscription", cost: { input: 0.1, output: 0.5, cacheRead: 0.01 }, tiers: ["fast"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max"], notes: "Ultra-low quota burn (0.01/M cache read) — fast recon, search, and doc/config checks" },
+	{ providerInstanceId: "codex", id: "gpt-6-astra", label: "GPT-6-Astra", family: "openai", billing: "subscription", cost: { input: 10, output: 50, cacheRead: 1 }, tiers: ["frontier"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Heavy frontier (10x cache burn vs Sol) — reserve for bounded hard slices/review, avoid as coordinator" },
+	{ providerInstanceId: "codex", id: "gpt-6.1-sol", label: "GPT-6.1-Sol", family: "openai", billing: "subscription", cost: { input: 2, output: 10, cacheRead: 0.1 }, tiers: ["workhorse", "long_context"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Primary subscription workhorse (500k context, $0.10/M cache read) — ideal Coordinator & Integrator" },
+	{ providerInstanceId: "codex", id: "gpt-6-luna", label: "GPT-6-Luna", family: "openai", billing: "subscription", cost: { input: 0.1, output: 0.5, cacheRead: 0.01 }, tiers: ["fast"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max"], notes: "Ultra-low quota burn ($0.01/M cache read) — fast recon, search, and doc/config checks" },
 	{ providerInstanceId: "codex", id: "gpt-6-sol", label: "GPT-6-Sol", family: "openai", billing: "subscription", cost: { input: 2, output: 10, cacheRead: 0.1 }, tiers: ["workhorse"], generation: "legacy", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Superseded by gpt-6.1-sol" },
 	{ providerInstanceId: "codex", id: "gpt-5.6-sol", label: "GPT-5.6-Sol", family: "openai", billing: "subscription", cost: { input: 2, output: 10, cacheRead: 0.1 }, tiers: ["workhorse"], generation: "legacy", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Legacy 5.6 generation" },
 	{ providerInstanceId: "codex", id: "gpt-5.6-terra", label: "GPT-5.6-Terra", family: "openai", billing: "subscription", cost: { input: 2, output: 10, cacheRead: 0.1 }, tiers: ["workhorse"], generation: "legacy", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Legacy 5.6 generation" },
@@ -160,50 +174,140 @@ export function pickReasoning(desired, options = []) {
 
 export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 	const usagePath = path.join(homeDir, ".t3", "userdata", "usage-scan-cache-v5.json");
-	if (!fs.existsSync(usagePath)) return null;
-	try {
-		const data = JSON.parse(fs.readFileSync(usagePath, "utf8"));
-		const sevenDaysAgo = nowMs - 7 * 86400 * 1000;
-		const thirtyDaysAgo = nowMs - 30 * 86400 * 1000;
-		const byProvider = {};
-		const byModel = {};
+	const sevenDaysAgo = nowMs - 7 * 86400 * 1000;
+	const thirtyDaysAgo = nowMs - 30 * 86400 * 1000;
+	const byProvider = {};
+	const byModel = {};
+	const liveRateLimits = {};
 
-		for (const fileEntry of Object.values(data.files || {})) {
-			const rawProv = fileEntry.p || "unknown";
-			const prov = rawProv === "claude" ? "claudeAgent" : rawProv;
-			for (const row of fileEntry.r || []) {
-				const [ts, mIdx, , inTok = 0, cacheRead = 0, , outTok = 0] = row;
-				const modelSlug = data.models?.[mIdx] || "unknown";
-				const known = CANONICAL_MODELS.find((c) => canonicalBaseKey(c.id) === canonicalBaseKey(modelSlug));
-				const rates = known?.cost || { input: 2, output: 10, cacheRead: 0.1 };
-				const turnCostUsd = (inTok / 1e6) * (rates.input || 0) + (cacheRead / 1e6) * (rates.cacheRead || 0) + (outTok / 1e6) * (rates.output || 0);
+	if (fs.existsSync(usagePath)) {
+		try {
+			const data = JSON.parse(fs.readFileSync(usagePath, "utf8"));
+			const existingCodexFiles = [];
 
-				const totalTokens = (inTok || 0) + (cacheRead || 0) + (outTok || 0);
-				if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensTotal: 0, turns7d: 0, turnsTotal: 0 };
-				byProvider[prov].usdTotal += turnCostUsd;
-				byProvider[prov].tokensTotal += totalTokens;
-				byProvider[prov].turnsTotal += 1;
-				if (ts >= thirtyDaysAgo) byProvider[prov].usd30d += turnCostUsd;
-				if (ts >= sevenDaysAgo) {
-					byProvider[prov].usd7d += turnCostUsd;
-					byProvider[prov].tokens7d += totalTokens;
-					byProvider[prov].turns7d += 1;
-				}
+			for (const [filePath, fileEntry] of Object.entries(data.files || {})) {
+				const rawProv = fileEntry.p || "unknown";
+				const prov = rawProv === "claude" ? "claudeAgent" : rawProv;
+				if (prov === "codex" && fs.existsSync(filePath)) existingCodexFiles.push(filePath);
 
-				if (!byModel[modelSlug]) byModel[modelSlug] = { usd7d: 0, usd30d: 0, usdTotal: 0, turns7d: 0, turnsTotal: 0 };
-				byModel[modelSlug].usdTotal += turnCostUsd;
-				byModel[modelSlug].turnsTotal += 1;
-				if (ts >= thirtyDaysAgo) byModel[modelSlug].usd30d += turnCostUsd;
-				if (ts >= sevenDaysAgo) {
-					byModel[modelSlug].usd7d += turnCostUsd;
-					byModel[modelSlug].turns7d += 1;
+				for (const row of fileEntry.r || []) {
+					const [ts, mIdx, , inTok = 0, cacheRead = 0, , outTok = 0] = row;
+					const modelSlug = data.models?.[mIdx] || "unknown";
+					const known = CANONICAL_MODELS.find((c) => canonicalBaseKey(c.id) === canonicalBaseKey(modelSlug));
+					const rates = known?.cost || { input: 2, output: 10, cacheRead: 0.1 };
+					const turnCostUsd = (inTok / 1e6) * (rates.input || 0) + (cacheRead / 1e6) * (rates.cacheRead || 0) + (outTok / 1e6) * (rates.output || 0);
+					const totalTokens = (inTok || 0) + (cacheRead || 0) + (outTok || 0);
+
+					if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokens30d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turns30d: 0, turnsTotal: 0 };
+					byProvider[prov].usdTotal += turnCostUsd;
+					byProvider[prov].tokensTotal += totalTokens;
+					byProvider[prov].turnsTotal += 1;
+					if (ts >= thirtyDaysAgo) {
+						byProvider[prov].usd30d += turnCostUsd;
+						byProvider[prov].tokens30d += totalTokens;
+						byProvider[prov].turns30d += 1;
+					}
+					if (ts >= sevenDaysAgo) {
+						byProvider[prov].usd7d += turnCostUsd;
+						byProvider[prov].tokens7d += totalTokens;
+						byProvider[prov].inTok7d += inTok || 0;
+						byProvider[prov].cacheRead7d += cacheRead || 0;
+						byProvider[prov].outTok7d += outTok || 0;
+						byProvider[prov].turns7d += 1;
+					}
+
+					const mKey = `${prov}:${modelSlug}`;
+					if (!byModel[mKey]) byModel[mKey] = { provider: prov, model: modelSlug, billing: "subscription", usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turnsTotal: 0 };
+					byModel[mKey].usdTotal += turnCostUsd;
+					byModel[mKey].tokensTotal += totalTokens;
+					byModel[mKey].turnsTotal += 1;
+					if (ts >= thirtyDaysAgo) byModel[mKey].usd30d += turnCostUsd;
+					if (ts >= sevenDaysAgo) {
+						byModel[mKey].usd7d += turnCostUsd;
+						byModel[mKey].tokens7d += totalTokens;
+						byModel[mKey].inTok7d += inTok || 0;
+						byModel[mKey].cacheRead7d += cacheRead || 0;
+						byModel[mKey].outTok7d += outTok || 0;
+						byModel[mKey].turns7d += 1;
+					}
 				}
 			}
-		}
-		return { byProvider, byModel };
-	} catch {
-		return null;
+
+			if (existingCodexFiles.length > 0) {
+				const latestFile = existingCodexFiles[existingCodexFiles.length - 1];
+				const tail = fs.readFileSync(latestFile, "utf8").trim().split("\n").slice(-30);
+				for (let i = tail.length - 1; i >= 0; i--) {
+					try {
+						const parsed = JSON.parse(tail[i]);
+						if (parsed?.payload?.rate_limits?.primary) {
+							liveRateLimits.codex = {
+								planType: parsed.payload.rate_limits.plan_type || "pro",
+								usedPercent: parsed.payload.rate_limits.primary.used_percent,
+								resetsAtSec: parsed.payload.rate_limits.primary.resets_at,
+							};
+							break;
+						}
+					} catch {}
+				}
+			}
+		} catch {}
 	}
+
+	const ocDbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+	if (fs.existsSync(ocDbPath)) {
+		try {
+			const sql = `SELECT json_extract(data, '$.providerID') || '/' || json_extract(data, '$.modelID') AS model, json_extract(data, '$.time.created') AS ts, COALESCE(json_extract(data, '$.tokens.input'), 0) AS in_tok, COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS cache_read, COALESCE(json_extract(data, '$.tokens.output'), 0) AS out_tok, COALESCE(json_extract(data, '$.cost'), 0) AS cost FROM message WHERE json_extract(data, '$.role') = 'assistant';`;
+			const rawRows = execFileSync("sqlite3", ["-separator", "|", ocDbPath, sql], { encoding: "utf8", timeout: 3000 }).trim();
+			if (rawRows) {
+				for (const line of rawRows.split("\n")) {
+					const [modelSlug, tsRaw, inRaw, cacheRaw, outRaw, costRaw] = line.split("|");
+					if (!modelSlug) continue;
+					const ts = Number(tsRaw) || 0;
+					const inTok = Number(inRaw) || 0;
+					const cacheRead = Number(cacheRaw) || 0;
+					const outTok = Number(outRaw) || 0;
+					const totalTokens = inTok + cacheRead + outTok;
+					const recordedCost = Number(costRaw) || 0;
+					const prov = "opencode";
+
+					if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokens30d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turns30d: 0, turnsTotal: 0 };
+					byProvider[prov].usdTotal += recordedCost;
+					byProvider[prov].tokensTotal += totalTokens;
+					byProvider[prov].turnsTotal += 1;
+					if (ts >= thirtyDaysAgo) {
+						byProvider[prov].usd30d += recordedCost;
+						byProvider[prov].tokens30d += totalTokens;
+						byProvider[prov].turns30d += 1;
+					}
+					if (ts >= sevenDaysAgo) {
+						byProvider[prov].usd7d += recordedCost;
+						byProvider[prov].tokens7d += totalTokens;
+						byProvider[prov].inTok7d += inTok;
+						byProvider[prov].cacheRead7d += cacheRead;
+						byProvider[prov].outTok7d += outTok;
+						byProvider[prov].turns7d += 1;
+					}
+
+					const mKey = `${prov}:${modelSlug}`;
+					if (!byModel[mKey]) byModel[mKey] = { provider: prov, model: modelSlug, billing: "api", usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turnsTotal: 0 };
+					byModel[mKey].usdTotal += recordedCost;
+					byModel[mKey].tokensTotal += totalTokens;
+					byModel[mKey].turnsTotal += 1;
+					if (ts >= thirtyDaysAgo) byModel[mKey].usd30d += recordedCost;
+					if (ts >= sevenDaysAgo) {
+						byModel[mKey].usd7d += recordedCost;
+						byModel[mKey].tokens7d += totalTokens;
+						byModel[mKey].inTok7d += inTok;
+						byModel[mKey].cacheRead7d += cacheRead;
+						byModel[mKey].outTok7d += outTok;
+						byModel[mKey].turns7d += 1;
+					}
+				}
+			}
+		} catch {}
+	}
+
+	return Object.keys(byProvider).length > 0 ? { byProvider, byModel, liveRateLimits } : null;
 }
 
 export function discoverRuntimeState(homeDir = os.homedir()) {
@@ -299,20 +403,48 @@ export function discoverRuntimeState(homeDir = os.homedir()) {
 	};
 }
 
+export function normalizePlans(rawPlans = {}) {
+	const out = {};
+	for (const [k, v] of Object.entries(rawPlans || {})) {
+		const prov = normalizeProvider(k);
+		const num = Number(String(v).replace(/^\$/, ""));
+		if (!Number.isNaN(num) && num > 0) out[prov] = num;
+	}
+	return out;
+}
+
 export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHarnesses = null, runtimeState = null, options = {}) {
 	const defaults = { latestGenerationOnly: true, preferDirectProvider: true, crossFamilyReview: true, respectRuntimeSettings: true, ...(config?.defaults || {}) };
+	const plans = {
+		codex: 200,
+		claudeAgent: 100,
+		...normalizePlans(config?.plans),
+		...normalizePlans(options.plans),
+	};
+
+	const derivedWeeklyLimits = {};
+	for (const [prov, planUsd] of Object.entries(plans)) {
+		derivedWeeklyLimits[prov] = planToWeeklyLimitUsd(prov, planUsd);
+	}
+
 	const budgetCfg = {
 		mode: options.budgetMode || config?.budget?.mode || "balanced",
 		coordinatorTier: config?.budget?.coordinatorTier || "workhorse",
 		preferSubscriptionOverApi: true,
+		spreadAcrossSubscriptions: true,
 		blockApiSubproviders: ["openai", "anthropic"],
-		autoThrottle: options.autoThrottle ?? config?.budget?.autoThrottle ?? Boolean(options.weeklyLimits),
-		weeklyLimitUsdEquivalent: { codex: 250, claudeAgent: 250, ...(config?.budget?.weeklyLimitUsdEquivalent || {}), ...(options.weeklyLimits || {}) },
+		autoThrottle: options.autoThrottle ?? config?.budget?.autoThrottle ?? true,
+		weeklyLimitUsdEquivalent: { ...derivedWeeklyLimits, ...(config?.budget?.weeklyLimitUsdEquivalent || {}), ...(options.weeklyLimits || {}) },
 		autoDowngradeAbovePercent: config?.budget?.autoDowngradeAbovePercent ?? 80,
 		...(config?.budget || {}),
 	};
 	if (options.budgetMode) budgetCfg.mode = options.budgetMode;
 	if (options.autoThrottle !== undefined) budgetCfg.autoThrottle = options.autoThrottle;
+	if (options.plans) {
+		for (const [prov, planUsd] of Object.entries(normalizePlans(options.plans))) {
+			budgetCfg.weeklyLimitUsdEquivalent[prov] = planToWeeklyLimitUsd(prov, planUsd);
+		}
+	}
 	if (options.weeklyLimits) {
 		budgetCfg.weeklyLimitUsdEquivalent = { ...budgetCfg.weeklyLimitUsdEquivalent, ...options.weeklyLimits };
 		budgetCfg.autoThrottle = true;
@@ -332,16 +464,24 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const isTokenLimit = typeof rawLimit === "string" && /[mk]$/i.test(rawLimit.trim());
 		const limitVal = isTokenLimit ? (rawLimit.toLowerCase().endsWith("m") ? parseFloat(rawLimit) * 1e6 : parseFloat(rawLimit) * 1e3) : Number(String(rawLimit).replace(/^\$/, ""));
 		const currentVal = isTokenLimit ? tokens7d : spent7d;
-		const pct = limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : 0;
+		let pct = limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : 0;
+
+		const liveLimit = runtimeState?.usage?.liveRateLimits?.[prov];
+		if (!isTokenLimit && liveLimit?.usedPercent !== undefined && plans[prov] === 200 && !options.weeklyLimits?.[prov]) {
+			pct = liveLimit.usedPercent;
+		}
+
 		const overThreshold = pct >= budgetCfg.autoDowngradeAbovePercent;
 		const throttled = Boolean(budgetCfg.autoThrottle && overThreshold);
 		if (throttled) throttledProviders.add(prov);
 		quotaStatus[prov] = {
+			planMonthlyUsd: plans[prov] || null,
 			unit: isTokenLimit ? "tokens" : "usd",
 			spent7dUsd: Number(spent7d.toFixed(2)),
 			tokens7dM: Number((tokens7d / 1e6).toFixed(1)),
 			weeklyLimit: rawLimit,
 			percentUsed: pct,
+			liveServerReported: Boolean(!isTokenLimit && liveLimit?.usedPercent !== undefined && plans[prov] === 200 && !options.weeklyLimits?.[prov]),
 			overThreshold,
 			throttled,
 		};
@@ -394,6 +534,11 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		if (budgetCfg.preferSubscriptionOverApi && a.billing !== b.billing) {
 			return a.billing === "subscription" ? -1 : 1;
 		}
+		if (budgetCfg.spreadAcrossSubscriptions && a.billing === "subscription" && b.billing === "subscription" && a.providerInstanceId !== b.providerInstanceId) {
+			const aPct = quotaStatus[a.providerInstanceId]?.percentUsed ?? 0;
+			const bPct = quotaStatus[b.providerInstanceId]?.percentUsed ?? 0;
+			if (Math.abs(aPct - bPct) >= 10) return aPct - bPct;
+		}
 		return effectiveCostScore(a) - effectiveCostScore(b);
 	};
 
@@ -425,6 +570,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	const coordinator = coordinatorRaw ? { ...coordinatorRaw, reasoning: pickReasoning(reasoningCfg.coordinator, coordinatorRaw.reasoningOptions || ["medium"]) } : null;
 
 	const primaryImpl = tiers.workhorse[0] || tiers.frontier[0] || tiers.fast[0] || null;
+	const secondarySubImpl = tiers.workhorse.find((m) => m.billing === "subscription" && m.providerInstanceId !== primaryImpl?.providerInstanceId) || null;
 	const budgetImpl = [...tiers.workhorse].sort((a, b) => effectiveCostScore(a) - effectiveCostScore(b))[0] || tiers.fast[0] || null;
 	const reviewerPool = budgetCfg.mode === "economy" ? [...tiers.workhorse, ...tiers.frontier] : [...tiers.frontier, ...tiers.workhorse];
 	const crossFamilyReviewer = defaults.crossFamilyReview && primaryImpl ? reviewerPool.find((m) => m.family !== primaryImpl.family) || reviewerPool[0] : reviewerPool[0] || null;
@@ -433,6 +579,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 
 	return {
 		defaults,
+		plans,
 		budget: budgetCfg,
 		quotaStatus,
 		reasoning: reasoningCfg,
@@ -443,6 +590,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		recommended: {
 			coordinator,
 			primaryImplementer: primaryImpl,
+			secondaryImplementer: secondarySubImpl,
 			budgetImplementer: budgetImpl,
 			crossFamilyReviewer: reviewer,
 			fastRecon,
@@ -458,12 +606,13 @@ export function formatMarkdown(resolved) {
 	if (resolved.disabledProviders?.length) {
 		lines.push(`- **Disabled T3 Providers (skipped):** \`${resolved.disabledProviders.join("`, `")}\``);
 	}
-	if (resolved.QuotaSummary || Object.keys(resolved.quotaStatus || {}).length) {
+	if (Object.keys(resolved.quotaStatus || {}).length) {
 		const parts = Object.entries(resolved.quotaStatus).map(([prov, q]) => {
+			const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
 			const label = q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} 7d eq (${q.tokens7dM}M tok)`;
-			return `\`${prov}\`: ${label} (${q.percentUsed}%${q.throttled ? " - THROTTLED" : ""})`;
+			return `\`${prov}\` (${planTag}): ${label} -> **${q.percentUsed}% used**${q.throttled ? " **[THROTTLED]**" : ""}`;
 		});
-		lines.push(`- **7-Day Rolling Quota Burn:** ${parts.join(" | ")}`);
+		lines.push(`- **7-Day Subscription Headroom:** ${parts.join(" | ")}`);
 	}
 	lines.push("");
 	lines.push("| Capability Tier | Provider | Model ID | Billing | Cost ($/M In/Out/Cache) | Reasoning | Family |");
@@ -492,10 +641,66 @@ export function formatMarkdown(resolved) {
 		const impl = resolved.recommended.primaryImplementer;
 		lines.push(`- **Primary Feature / UI / Integration (\`@workhorse\`):** \`${impl.providerInstanceId}:${impl.id}\` (\`${impl.reasoning}\`, \`${impl.billing}\`)`);
 	}
+	if (resolved.recommended.secondaryImplementer) {
+		const sec = resolved.recommended.secondaryImplementer;
+		lines.push(`- **Secondary Parallel Slice (\`@workhorse\` load-balanced):** \`${sec.providerInstanceId}:${sec.id}\` (\`${sec.reasoning}\`, \`${sec.billing}\`)`);
+	}
 	if (resolved.recommended.crossFamilyReviewer) {
 		const rev = resolved.recommended.crossFamilyReviewer;
 		lines.push(`- **Independent Reviewer (\`@reviewer\`):** \`${rev.providerInstanceId}:${rev.id}\` (\`${rev.reasoning}\`, family: \`${rev.family}\`)`);
 	}
+	return lines.join("\n");
+}
+
+export function formatUsageReport(runtimeState, resolved) {
+	const usage = runtimeState?.usage;
+	if (!usage) return "No local usage telemetry found.";
+
+	const models = Object.values(usage.byModel || {}).sort((a, b) => b.usdTotal - a.usdTotal);
+	const totalTurns7d = models.reduce((s, m) => s + m.turns7d, 0) || 1;
+	const totalTok7d = models.reduce((s, m) => s + m.tokens7d, 0) || 1;
+	const totalUsd7d = models.reduce((s, m) => s + m.usd7d, 0) || 0.01;
+
+	const lines = [
+		"## Task-Router Usage, Cost & Subscription ROI Report",
+		"",
+		"### 1. Per-Model Breakdown (Rolling 7 Days & All-Time)",
+		"",
+		"| Provider | Model | Billing | 7d Turns (% Share) | 7d Tokens (In / Cache / Out) | 7d Cost / API-Eq (% Share) | All-Time Cost / Eq |",
+		"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+	];
+
+	for (const m of models) {
+		const turnPct = Math.round((m.turns7d / totalTurns7d) * 100);
+		const costPct = Math.round((m.usd7d / totalUsd7d) * 100);
+		const tokM = (m.tokens7d / 1e6).toFixed(1);
+		const inM = (m.inTok7d / 1e6).toFixed(1);
+		const cacheM = (m.cacheRead7d / 1e6).toFixed(1);
+		const outM = (m.outTok7d / 1e6).toFixed(2);
+		const costTag = m.billing === "api" ? `$${m.usd7d.toFixed(2)} billed` : `$${m.usd7d.toFixed(2)} sub-eq`;
+		lines.push(`| \`${m.provider}\` | \`${m.model}\` | \`${m.billing}\` | ${m.turns7d} (${turnPct}%) | ${tokM}M (${inM}M / ${cacheM}M / ${outM}M) | **${costTag}** (${costPct}%) | $${m.usdTotal.toFixed(2)} |`);
+	}
+
+	const astraEntry = models.find((m) => m.model === "gpt-6-astra");
+	const solIfReplacedUsd = astraEntry ? (astraEntry.inTok7d / 1e6) * 2 + (astraEntry.cacheRead7d / 1e6) * 0.1 + (astraEntry.outTok7d / 1e6) * 10 : 0;
+	const currentCodex7d = usage.byProvider?.codex?.usd7d || 0;
+	const optimizedCodex7d = astraEntry ? currentCodex7d - astraEntry.usd7d + solIfReplacedUsd : currentCodex7d;
+	const total7dInTok = models.reduce((s, m) => s + m.inTok7d, 0);
+	const total7dCacheTok = models.reduce((s, m) => s + m.cacheRead7d, 0);
+	const total7dOutTok = models.reduce((s, m) => s + m.outTok7d, 0);
+	const googleArgonWeeklyApiCost = (total7dInTok / 1e6) * 2 + (total7dCacheTok / 1e6) * 0.1 + (total7dOutTok / 1e6) * 10;
+
+	lines.push("");
+	lines.push("### 2. Subscription Plan Simulator (Based on Your Actual 7-Day Workload)");
+	lines.push(`- **Current 7d Codex burn (with Astra as Coordinator):** **$${currentCodex7d.toFixed(2)}/wk eq** (Server-reported: **${usage.liveRateLimits?.codex?.usedPercent ?? "?"}%** of $200 Pro weekly limit)`);
+	lines.push(`- **Optimized 7d burn (replacing Astra Coordinator with \`gpt-6.1-sol\` / \`claude-sonnet-5-5\`):** **$${optimizedCodex7d.toFixed(2)}/wk eq** (**-${Math.round((1 - optimizedCodex7d / Math.max(currentCodex7d, 1)) * 100)}% quota burn** for the exact same ${ (totalTok7d / 1e6).toFixed(0) }M tokens!)`);
+	lines.push("");
+	lines.push("| Plan Option | Monthly Cost | Combined Weekly Capacity (Eq) | Est. Weekly Usage (Optimized) | Verdict |", "| :--- | :--- | :--- | :--- | :--- |");
+	lines.push(`| \`openai=200\` (Current) | $200/mo | ~$1,750/wk eq | ~${Math.round((optimizedCodex7d / 1750) * 100)}% used | Huge headroom, no second sub needed unless for Claude review |`);
+	lines.push(`| \`openai=20, claude=100\` | **$120/mo** | ~$625/wk eq ($175 + $450) | **~${Math.round((optimizedCodex7d / 625) * 100)}% used** | **Best Value / Sweet Spot** — saves $80/mo + gives cross-family Opus/Sonnet |`);
+	lines.push(`| \`openai=20, claude=20\` | $40/mo | ~$265/wk eq ($175 + $90) | ~${Math.round((optimizedCodex7d / 265) * 100)}% used | Tight on heavy weeks (${Math.round(totalTurns7d)} turns/wk); requires offloading ~40% to DeepSeek/GLM |`);
+	lines.push(`| Pay-per-token Google API (\`gemini-4-argon\`) | **~$${Math.round(googleArgonWeeklyApiCost * 4.3)}/mo** ($${googleArgonWeeklyApiCost.toFixed(0)}/wk) | Unlimited (billed per token) | 100% billed | **More expensive than subscriptions** at ${(total7dCacheTok / 1e6).toFixed(0)}M cached tokens/wk |`);
+
 	return lines.join("\n");
 }
 
@@ -534,9 +739,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const configIdx = args.indexOf("--config");
 	const harnessIdx = args.indexOf("--harness");
 	const budgetIdx = args.indexOf("--budget");
+	const planIdx = args.indexOf("--plan");
 	const limitIdx = args.indexOf("--weekly-limit");
 	const autoThrottle = args.includes("--throttle") ? true : undefined;
 	const staticOnly = args.includes("--static");
+	const showReport = args.includes("--report");
 	const asJson = args.includes("--json");
 
 	const config = loadConfig(configIdx !== -1 ? args[configIdx + 1] : null);
@@ -545,10 +752,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const activeHarnesses = harnessIdx !== -1 ? args[harnessIdx + 1].split(",").map((h) => normalizeProvider(h.trim())) : null;
 	const options = {
 		budgetMode: budgetIdx !== -1 ? args[budgetIdx + 1] : undefined,
+		plans: planIdx !== -1 ? parseLimitsArg(args[planIdx + 1]) : undefined,
 		weeklyLimits: limitIdx !== -1 ? parseLimitsArg(args[limitIdx + 1]) : undefined,
 		autoThrottle,
 	};
 
 	const resolved = resolveModels(config, catalogModels, activeHarnesses, runtimeState, options);
-	console.log(asJson ? JSON.stringify(resolved, null, 2) : formatMarkdown(resolved));
+	if (showReport) {
+		console.log(formatUsageReport(runtimeState, resolved));
+	} else {
+		console.log(asJson ? JSON.stringify(resolved, null, 2) : formatMarkdown(resolved));
+	}
 }

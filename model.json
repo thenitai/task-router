@@ -5,16 +5,17 @@
     "crossFamilyReview": true,
     "respectRuntimeSettings": true
   },
+  "plans": {
+    "openai": 200,
+    "claude": 100
+  },
   "budget": {
     "mode": "balanced",
     "coordinatorTier": "workhorse",
     "preferSubscriptionOverApi": true,
+    "spreadAcrossSubscriptions": true,
     "blockApiSubproviders": ["openai", "anthropic"],
-    "autoThrottle": false,
-    "weeklyLimitUsdEquivalent": {
-      "codex": 250,
-      "claudeAgent": 250
-    },
+    "autoThrottle": true,
     "autoDowngradeAbovePercent": 80
   },
   "select": [
