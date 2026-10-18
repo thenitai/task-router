@@ -178,12 +178,15 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 				const rates = known?.cost || { input: 2, output: 10, cacheRead: 0.1 };
 				const turnCostUsd = (inTok / 1e6) * (rates.input || 0) + (cacheRead / 1e6) * (rates.cacheRead || 0) + (outTok / 1e6) * (rates.output || 0);
 
-				if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usd30d: 0, usdTotal: 0, turns7d: 0, turnsTotal: 0 };
+				const totalTokens = (inTok || 0) + (cacheRead || 0) + (outTok || 0);
+				if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensTotal: 0, turns7d: 0, turnsTotal: 0 };
 				byProvider[prov].usdTotal += turnCostUsd;
+				byProvider[prov].tokensTotal += totalTokens;
 				byProvider[prov].turnsTotal += 1;
 				if (ts >= thirtyDaysAgo) byProvider[prov].usd30d += turnCostUsd;
 				if (ts >= sevenDaysAgo) {
 					byProvider[prov].usd7d += turnCostUsd;
+					byProvider[prov].tokens7d += totalTokens;
 					byProvider[prov].turns7d += 1;
 				}
 
@@ -323,13 +326,25 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 
 	const throttledProviders = new Set();
 	const quotaStatus = {};
-	for (const [prov, limitUsd] of Object.entries(budgetCfg.weeklyLimitUsdEquivalent || {})) {
+	for (const [prov, rawLimit] of Object.entries(budgetCfg.weeklyLimitUsdEquivalent || {})) {
 		const spent7d = runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0;
-		const pct = limitUsd > 0 ? Math.round((spent7d / limitUsd) * 100) : 0;
+		const tokens7d = runtimeState?.usage?.byProvider?.[prov]?.tokens7d ?? 0;
+		const isTokenLimit = typeof rawLimit === "string" && /[mk]$/i.test(rawLimit.trim());
+		const limitVal = isTokenLimit ? (rawLimit.toLowerCase().endsWith("m") ? parseFloat(rawLimit) * 1e6 : parseFloat(rawLimit) * 1e3) : Number(String(rawLimit).replace(/^\$/, ""));
+		const currentVal = isTokenLimit ? tokens7d : spent7d;
+		const pct = limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : 0;
 		const overThreshold = pct >= budgetCfg.autoDowngradeAbovePercent;
 		const throttled = Boolean(budgetCfg.autoThrottle && overThreshold);
 		if (throttled) throttledProviders.add(prov);
-		quotaStatus[prov] = { spent7dUsd: Number(spent7d.toFixed(2)), weeklyLimitUsd: limitUsd, percentUsed: pct, overThreshold, throttled };
+		quotaStatus[prov] = {
+			unit: isTokenLimit ? "tokens" : "usd",
+			spent7dUsd: Number(spent7d.toFixed(2)),
+			tokens7dM: Number((tokens7d / 1e6).toFixed(1)),
+			weeklyLimit: rawLimit,
+			percentUsed: pct,
+			overThreshold,
+			throttled,
+		};
 	}
 
 	const filtered = enriched.filter((model) => {
@@ -444,7 +459,10 @@ export function formatMarkdown(resolved) {
 		lines.push(`- **Disabled T3 Providers (skipped):** \`${resolved.disabledProviders.join("`, `")}\``);
 	}
 	if (resolved.QuotaSummary || Object.keys(resolved.quotaStatus || {}).length) {
-		const parts = Object.entries(resolved.quotaStatus).map(([prov, q]) => `\`${prov}\`: $${q.spent7dUsd} / $${q.weeklyLimitUsd} 7d eq (${q.percentUsed}%${q.throttled ? " - THROTTLED" : ""})`);
+		const parts = Object.entries(resolved.quotaStatus).map(([prov, q]) => {
+			const label = q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} 7d eq (${q.tokens7dM}M tok)`;
+			return `\`${prov}\`: ${label} (${q.percentUsed}%${q.throttled ? " - THROTTLED" : ""})`;
+		});
 		lines.push(`- **7-Day Rolling Quota Burn:** ${parts.join(" | ")}`);
 	}
 	lines.push("");
@@ -499,7 +517,14 @@ function parseLimitsArg(raw) {
 	const out = {};
 	for (const part of String(raw || "").split(",")) {
 		const [k, v] = part.split("=");
-		if (k && v && !Number.isNaN(Number(v))) out[normalizeProvider(k.trim())] = Number(v);
+		if (!k || !v) continue;
+		const clean = v.trim();
+		if (/[mk]$/i.test(clean)) {
+			out[normalizeProvider(k.trim())] = clean.toUpperCase();
+		} else {
+			const num = Number(clean.replace(/^\$/, ""));
+			if (!Number.isNaN(num)) out[normalizeProvider(k.trim())] = num;
+		}
 	}
 	return out;
 }

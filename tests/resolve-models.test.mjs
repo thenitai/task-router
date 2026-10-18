@@ -46,7 +46,7 @@ test("recommends workhorse coordinator (not gpt-6-astra) in balanced mode and bl
 	assert.equal(resolved.recommended.coordinator.id, "gpt-6.1-sol", "picks workhorse gpt-6.1-sol as coordinator instead of gpt-6-astra");
 });
 
-test("throttles a provider when 7-day spend exceeds weekly limit threshold and supports --budget economy", () => {
+test("throttles a provider when 7-day spend or token volume exceeds weekly limit threshold and supports --budget economy", () => {
 	const runtimeState = {
 		disabledProviders: new Set(),
 		hiddenModelsByProvider: new Map(),
@@ -55,16 +55,21 @@ test("throttles a provider when 7-day spend exceeds weekly limit threshold and s
 		connectedOpencodeSubproviders: new Set(["google", "cloudflare-workers-ai", "opencode"]),
 		usage: {
 			byProvider: {
-				codex: { usd7d: 42, usd30d: 180, usdTotal: 690, turns7d: 500, turnsTotal: 4000 },
-				claudeAgent: { usd7d: 10, usd30d: 25, usdTotal: 25, turns7d: 100, turnsTotal: 250 },
+				codex: { usd7d: 42, usd30d: 180, usdTotal: 690, tokens7d: 350_000_000, tokensTotal: 550_000_000, turns7d: 500, turnsTotal: 4000 },
+				claudeAgent: { usd7d: 10, usd30d: 25, usdTotal: 25, tokens7d: 15_000_000, tokensTotal: 30_000_000, turns7d: 100, turnsTotal: 250 },
 			},
 		},
 	};
 	const resolved = resolveModels(defaultConfig, undefined, null, runtimeState, { weeklyLimits: { codex: 45, claudeAgent: 45 } });
-	assert.equal(resolved.quotaStatus.codex.throttled, true, "codex is throttled at 42/45 (93%)");
-	assert.equal(resolved.quotaStatus.claudeAgent.throttled, false, "claudeAgent is not throttled at 10/45 (22%)");
+	assert.equal(resolved.quotaStatus.codex.throttled, true, "codex is throttled at $42/$45 (93%)");
+	assert.equal(resolved.quotaStatus.claudeAgent.throttled, false, "claudeAgent is not throttled at $10/$45 (22%)");
 	assert.equal(resolved.recommended.coordinator.providerInstanceId, "claudeAgent", "shifts coordinator to unthrottled claudeAgent");
 	assert.equal(resolved.recommended.primaryImplementer.id, "claude-sonnet-5-5", "shifts primary implementer to claude-sonnet-5-5");
+
+	const tokenResolved = resolveModels(defaultConfig, undefined, null, runtimeState, { weeklyLimits: { codex: "300M", claudeAgent: "300M" } });
+	assert.equal(tokenResolved.quotaStatus.codex.unit, "tokens");
+	assert.equal(tokenResolved.quotaStatus.codex.throttled, true, "codex is throttled at 350M / 300M tokens");
+	assert.equal(tokenResolved.quotaStatus.claudeAgent.throttled, false, "claudeAgent is not throttled at 15M / 300M tokens");
 
 	const economy = resolveModels(defaultConfig, undefined, null, null, { budgetMode: "economy" });
 	assert.equal(economy.recommended.primaryImplementer.id, "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813", "economy mode picks cheapest workhorse first");
