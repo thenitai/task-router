@@ -2,7 +2,19 @@
   "defaults": {
     "latestGenerationOnly": true,
     "preferDirectProvider": true,
-    "crossFamilyReview": true
+    "crossFamilyReview": true,
+    "respectRuntimeSettings": true
+  },
+  "budget": {
+    "mode": "balanced",
+    "coordinatorTier": "workhorse",
+    "preferSubscriptionOverApi": true,
+    "blockApiSubproviders": ["openai", "anthropic"],
+    "weeklyLimitUsdEquivalent": {
+      "codex": 45,
+      "claudeAgent": 45
+    },
+    "autoDowngradeAbovePercent": 80
   },
   "select": [
     "codex:all",
@@ -13,6 +25,7 @@
     "opencode:gemini-4*, gemini-3.8*, glm-5.3*, kimi-k3, deepseek-v4*"
   ],
   "reasoning": {
+    "coordinator": "medium",
     "frontier": "high",
     "workhorse": "medium",
     "reviewer": "high",

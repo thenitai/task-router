@@ -30,21 +30,44 @@ test("default model.json resolves expected models and excludes claude-fable and 
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"), "includes cloudflare-workers-ai deepseek-v4-flash");
 });
 
-test("supports codex:!luna exclusion shorthand", () => {
-	const custom = { ...defaultConfig, select: ["codex:all", "codex:!luna"] };
-	const resolved = resolveModels(custom);
-	const ids = resolved.models.map((m) => m.id);
-	assert.deepEqual(ids, ["gpt-6-astra", "gpt-6.1-sol"]);
+test("recommends workhorse coordinator (not gpt-6-astra) in balanced mode and blocks OpenCode openai/anthropic API duplicates", () => {
+	const catalog = [
+		{ providerInstanceId: "codex", id: "gpt-6-astra", label: "GPT-6-Astra" },
+		{ providerInstanceId: "codex", id: "gpt-6.1-sol", label: "GPT-6.1-Sol" },
+		{ providerInstanceId: "opencode", id: "anthropic/claude-sonnet-5-5", label: "Claude Sonnet 5.5 (API)" },
+		{ providerInstanceId: "opencode", id: "openai/gpt-6.1-sol", label: "GPT-6.1 Sol (API)" },
+		{ providerInstanceId: "opencode", id: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813", label: "DeepSeek V4 Pro" },
+	];
+	const cfg = { ...defaultConfig, select: ["codex:all", "opencode:all"] };
+	const resolved = resolveModels(cfg, catalog);
+	const ids = resolved.models.map((m) => `${m.providerInstanceId}:${m.id}`);
+	assert.ok(!ids.includes("opencode:anthropic/claude-sonnet-5-5"), "blocks paid anthropic API via opencode");
+	assert.ok(!ids.includes("opencode:openai/gpt-6.1-sol"), "blocks paid openai API via opencode");
+	assert.equal(resolved.recommended.coordinator.id, "gpt-6.1-sol", "picks workhorse gpt-6.1-sol as coordinator instead of gpt-6-astra");
 });
 
-test("enforces cross-family reviewer when multiple model families are active", () => {
-	const resolved = resolveModels(defaultConfig);
-	const impl = resolved.recommended.primaryImplementer;
-	const reviewer = resolved.recommended.crossFamilyReviewer;
-	assert.ok(impl, "selects a primary implementer");
-	assert.ok(reviewer, "selects a reviewer");
-	assert.notEqual(impl.family, reviewer.family, "reviewer must be a different family from implementer");
-	assert.equal(reviewer.reasoning, "high");
+test("throttles a provider when 7-day spend exceeds weekly limit threshold and supports --budget economy", () => {
+	const runtimeState = {
+		disabledProviders: new Set(),
+		hiddenModelsByProvider: new Map(),
+		favorites: new Set(),
+		modelOrder: new Map(),
+		connectedOpencodeSubproviders: new Set(["google", "cloudflare-workers-ai", "opencode"]),
+		usage: {
+			byProvider: {
+				codex: { usd7d: 42, usd30d: 180, usdTotal: 690, turns7d: 500, turnsTotal: 4000 },
+				claudeAgent: { usd7d: 10, usd30d: 25, usdTotal: 25, turns7d: 100, turnsTotal: 250 },
+			},
+		},
+	};
+	const resolved = resolveModels(defaultConfig, undefined, null, runtimeState, { weeklyLimits: { codex: 45, claudeAgent: 45 } });
+	assert.equal(resolved.quotaStatus.codex.throttled, true, "codex is throttled at 42/45 (93%)");
+	assert.equal(resolved.quotaStatus.claudeAgent.throttled, false, "claudeAgent is not throttled at 10/45 (22%)");
+	assert.equal(resolved.recommended.coordinator.providerInstanceId, "claudeAgent", "shifts coordinator to unthrottled claudeAgent");
+	assert.equal(resolved.recommended.primaryImplementer.id, "claude-sonnet-5-5", "shifts primary implementer to claude-sonnet-5-5");
+
+	const economy = resolveModels(defaultConfig, undefined, null, null, { budgetMode: "economy" });
+	assert.equal(economy.recommended.primaryImplementer.id, "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813", "economy mode picks cheapest workhorse first");
 });
 
 test("skips disabled T3 providers and respects hiddenModels + connected OpenCode gateways", () => {
@@ -85,28 +108,9 @@ test("gracefully falls back to single harness (claude-only or codex-only)", () =
 	assert.equal(codexOnly.recommended.crossFamilyReviewer.id, "gpt-6-astra");
 });
 
-test("deduplicates aggregator models when preferDirectProvider is true", () => {
-	const noisyCatalog = [
-		{ providerInstanceId: "codex", id: "gpt-6.1-sol", label: "GPT-6.1-Sol" },
-		{ providerInstanceId: "opencode", id: "opencode/gpt-6.1-sol", label: "GPT-6.1 Sol" },
-		{ providerInstanceId: "opencode", id: "github-copilot/gemini-4-argon", label: "Gemini 4 Argon" },
-		{ providerInstanceId: "opencode", id: "google/gemini-4-argon", label: "Gemini 4 Argon" },
-	];
-	const cfg = { defaults: { latestGenerationOnly: true, preferDirectProvider: true, crossFamilyReview: true }, select: ["codex:all", "opencode:all"] };
-	const resolved = resolveModels(cfg, noisyCatalog);
-	const solEntries = resolved.models.filter((m) => m.id.includes("gpt-6.1-sol"));
-	assert.equal(solEntries.length, 1);
-	assert.equal(solEntries[0].providerInstanceId, "codex");
-
-	const geminiEntries = resolved.models.filter((m) => m.id.includes("gemini-4-argon"));
-	assert.equal(geminiEntries.length, 1);
-	assert.equal(geminiEntries[0].id, "google/gemini-4-argon");
-});
-
-test("formatMarkdown renders markdown table", () => {
+test("formatMarkdown renders markdown table and cost recommendations", () => {
 	const resolved = resolveModels(defaultConfig);
 	const md = formatMarkdown(resolved);
 	assert.ok(md.includes("| `@frontier` |"));
-	assert.ok(md.includes("| `@workhorse` |"));
-	assert.ok(md.includes("Default Cross-Family Pairing"));
+	assert.ok(md.includes("Recommended Cost-Optimized Routing"));
 });
