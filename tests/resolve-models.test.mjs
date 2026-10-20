@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -145,6 +146,32 @@ test("gracefully falls back to single harness (claude-only or codex-only)", () =
 	assert.ok(codexOnly.models.every((m) => m.providerInstanceId === "codex"));
 	assert.equal(codexOnly.recommended.primaryImplementer.id, "gpt-6.1-sol");
 	assert.equal(codexOnly.recommended.crossFamilyReviewer.id, "gpt-6-astra");
+});
+
+test("CLI provider-only restrictions cover every role across budget modes and throttling", () => {
+	for (const [harness, provider, family] of [["codex", "codex", "openai"], ["claude", "claudeAgent", "anthropic"]]) {
+		for (const budget of ["balanced", "economy", "performance"]) {
+			const resolved = JSON.parse(execFileSync(process.execPath, [
+				path.join(__dirname, "..", "scripts", "resolve-models.mjs"),
+				"--config", path.join(__dirname, "..", "model.json"),
+				"--static", "--json", "--harness", harness, "--budget", budget,
+			], { encoding: "utf8" }));
+			const throttled = resolveModels(defaultConfig, undefined, [provider], {
+				usage: { liveRateLimits: { [provider]: { usedPercent: 100, rateLimitReached: true } } },
+			}, { budgetMode: budget });
+			assert.equal(throttled.quotaStatus[provider].throttled, true);
+			for (const result of [resolved, throttled]) {
+				assert.ok(result.recommended.crossFamilyReviewer, `${harness}/${budget} has a reviewer`);
+				for (const model of [...result.models, ...Object.values(result.tiers).flat(), ...Object.values(result.recommended).filter(Boolean)]) {
+					assert.equal(model.providerInstanceId, provider, `${harness}/${budget}: ${model.id}`);
+					assert.equal(model.family, family);
+				}
+			}
+		}
+		const unavailable = resolveModels(defaultConfig, undefined, [provider], { disabledProviders: new Set([provider]) });
+		assert.deepEqual(unavailable.models, []);
+		assert.ok(Object.values(unavailable.recommended).every((model) => model === null));
+	}
 });
 
 test("formatMarkdown renders markdown table and cost recommendations", () => {

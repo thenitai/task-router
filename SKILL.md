@@ -1,6 +1,6 @@
 ---
 name: task-router
-description: Act as the planner, cost-aware adaptive multi-model router, and subagent coordinator for software tasks. Investigates read-only, resolves active models, subscription plans (openai=200, claude=100), and rolling 7-day quota burn from model.json and local telemetry, load-balances across subscriptions while offloading routine work to fast/open-weight models, presents a routing plan with a hard approval gate, and orchestrates implementation, cross-family review, frontend testing, and git integration.
+description: Act as the planner, cost-aware adaptive multi-model router, and subagent coordinator for software tasks. Investigates read-only, resolves active models, subscription plans (openai=200, claude=100), and rolling 7-day quota burn from model.json and local telemetry, load-balances across subscriptions while offloading routine work to fast/open-weight models, presents a routing plan with a hard approval gate, and orchestrates implementation, independent review within the allowed provider pool, frontend testing, and git integration.
 ---
 
 # Task Router (`task-router`)
@@ -13,16 +13,25 @@ Act as the planner, cost-aware model router, and coordinator for the user's task
 
 Before assigning models to subagent roles, resolve the user's configured model pool and 7-day subscription headroom:
 
-1. Run the resolver script:
+1. Determine the allowed harnesses from the current host and the user's restrictions **before** resolving models:
+   - **Standalone Codex:** always pass `--harness codex`. Every role, including reviewer, must use direct Codex/OpenAI models.
+   - **Standalone Claude Code:** always pass `--harness claude`. Every role, including reviewer, must use direct Claude/Anthropic models.
+   - **T3 Code or another host with cross-provider delegation:** use the available delegated provider pool unless the user restricts it. Explicit “Codex only” / “OpenAI only” means `--harness codex`; “Claude only” / “Anthropic only” means `--harness claude`, even in T3 Code.
+   - Installed providers, subscriptions, local T3 settings, and model examples below do not grant permission to leave that pool. Do not infer the host from the coordinator's model alone: T3 can run a Codex or Claude coordinator.
+
+   Run the resolver with that restriction and retain it on **every** subsequent resolver call. For example, in standalone Codex:
    ```fish
-   node ~/.agents/skills/task-router/scripts/resolve-models.mjs
+   node ~/.agents/skills/task-router/scripts/resolve-models.mjs --harness codex
    ```
+   In standalone Claude Code, replace `codex` with `claude`. Omit `--harness` only when the host supports cross-provider delegation and the user has not restricted providers.
+
+   Treat the resulting pool as a hard boundary for all roles, substitutions, quota throttling, and budget modes. Cross-family review is a preference **within** that pool, never a reason to add DeepSeek or another excluded provider. With one family, use an independent same-family reviewer (prefer a different model when available). If the allowed pool is empty or cannot support a role, report the blocker; do not expand it automatically.
    Supported flags:
    - `--plan openai=200,claude=100` (or `openai=20,claude=100`) — set monthly subscription plan tiers (`$20`, `$100`, `$200`). Automatically maps each plan to its empirical weekly capacity (`$200` OpenAI Pro ≈ `$1750/wk eq`, `$20` OpenAI Plus ≈ `$175/wk eq`, `$200` Claude Max ≈ `$1500/wk eq`, `$100` Claude Max ≈ `$450/wk eq`, `$20` Claude Pro ≈ `$90/wk eq`), reads OpenAI's live server-reported `used_percent` from Codex session files, and **load-balances (`spreadAcrossSubscriptions: true`) toward whichever subscription has more remaining headroom**.
    - `--report` — generate a full **Usage, Cost & Subscription ROI Report** across T3 (`usage-scan-cache-v5.json`) and OpenCode (`opencode.db`), including a Plan Simulator comparing `$200`, `$120 ($20+$100)`, `$40 ($20+$20)`, and pay-per-token Google API.
    - `--budget economy|balanced|performance` — override `budget.mode` (`economy` ranks cheapest $/M models first; `balanced` prioritizes subscriptions + workhorse coordinator; `performance` promotes `@frontier`).
    - `--weekly-limit codex=150,claude=250` (or `codex=300M`) — custom weekly cap override in API-equivalent USD or raw token count (`M`/`k`).
-   - `--harness codex|claude|opencode` — restrict to a single harness when cross-provider delegation is unavailable.
+   - `--harness codex|claude|opencode` — hard restriction for every role; mandatory in standalone Codex/Claude Code and whenever the user requests provider-only routing.
 2. **Subscription vs API Protection:**
    - Direct `codex` (OpenAI subscription) and `claudeAgent` (Anthropic subscription) are always prioritized over paid API gateways.
    - `blockApiSubproviders: ["openai", "anthropic"]` blocks OpenCode's `openai/*` and `anthropic/*` API keys so Claude/OpenAI models never accidentally bill per-token over OpenCode.
@@ -39,7 +48,7 @@ Before assigning models to subagent roles, resolve the user's configured model p
 | `@workhorse` (Budget / Open-Weight) | `cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813`, `cloudflare-workers-ai/@cf/zai-org/glm-5.3` | **$1.32–$1.40** / $3.96–$4.40 / **$0.044–$0.26** | Unit tests, boilerplate, data transforms, and secondary implementation slices to preserve OpenAI/Claude subscription quota. |
 | `@workhorse` (Subscription) | `codex:gpt-6.1-sol`, `claudeAgent:claude-sonnet-5-5` | **$2.00** / $10.00 / **$0.10** | Coordinator, primary feature/UI/Pug/SPA DOM implementation, browser testing (`NadaMini`), and final git integration. |
 | `@frontier` | `claudeAgent:claude-opus-5-5` ($4/$20/$0.20), `codex:gpt-6-astra` ($10/$50/$1.00), `opencode:google/gemini-4-argon` ($2/$10/$0.10) | **$2.00–$10.00** / $10–$50 / **$0.10–$1.00** | Bounded complex backend/security/concurrency slices and adversarial code review. |
-| `@reviewer` | Cross-family `@frontier` or `@workhorse` at `high` reasoning | Bounded 1–3 turn review | Independent correctness and acceptance-criteria review from a **different model family** than the primary implementer. |
+| `@reviewer` | Independent `@frontier` or `@workhorse` at `high` reasoning | Bounded 1–3 turn review | Independent correctness and acceptance-criteria review within the allowed pool; prefer a different family only when available. |
 
 ---
 
@@ -47,7 +56,7 @@ Before assigning models to subagent roles, resolve the user's configured model p
 
 Inspect the relevant implementation and trace the affected behavior. Keep this phase **strictly read-only**: no file changes, dependency installation, worktree creation, or implementation agents.
 
-Run `node ~/.agents/skills/task-router/scripts/resolve-models.mjs` to inspect active models and 7-day subscription headroom. Ask focused questions when missing information materially affects the plan. Resolve routine choices using project conventions and your judgment.
+Run the resolver with the required harness restriction from section 0 to inspect active models and 7-day subscription headroom. Ask focused questions when missing information materially affects the plan. Resolve routine choices using project conventions and your judgment.
 
 Present one recommended plan covering:
 - **Intended behavior and acceptance criteria** (enumerated as an explicit checklist so no item can be silently dropped).
@@ -66,10 +75,10 @@ Ask for the user's approval and **STOP**. Wait for explicit approval in a later 
 
 Proceed autonomously through the approved implementation and completion workflow in `AGENTS.md`, including worktree setup, review, testing, integration into `develop`, push, and cleanup.
 
-Remain the coordinator:
+Remain the coordinator. Assign every role only from the restricted resolved pool; the model examples below apply only when included in that pool:
 - Offload narrow exploration/doc checks to `@fast` (`gpt-6-luna`, `claude-haiku-5-5`, `glm-5.3-flash`, `deepseek-v4-flash`) and boilerplate/test slices to budget `@workhorse` (`deepseek-v4-pro`, `glm-5.3`).
 - Use subscription `@workhorse` (`gpt-6.1-sol` or `claude-sonnet-5-5`, automatically preferring whichever subscription has more remaining headroom) for core implementation, UI/Pug/SPA incremental DOM updates, browser testing on `NadaMini`, and final integration.
-- Reserve `@frontier` (`claude-opus-5-5`, `gpt-6-astra`, or `google/gemini-4-argon`) for bounded hard slices and cross-family `@reviewer` (`high` reasoning).
+- Reserve `@frontier` (`claude-opus-5-5`, `gpt-6-astra`, or `google/gemini-4-argon`) for bounded hard slices and independent `@reviewer` (`high` reasoning).
 - Allow at most **five concurrent subagents**. Assign distinct file ownership and run dependent steps in order.
 - Give every agent a **self-contained brief** with:
   1. Enumerated requirements and settled decisions.
@@ -82,7 +91,7 @@ Remain the coordinator:
 
 ## 3. Verify and Complete
 
-Have the independent cross-family reviewer and frontend tester report findings against every enumerated checklist item. Have the implementer fix actionable issues and repeat affected checks. Ensure review and testing cover the final revision.
+Have the independent reviewer (same-family when the allowed pool has only one family) and frontend tester report findings against every enumerated checklist item. Have the implementer fix actionable issues and repeat affected checks. Ensure review and testing cover the final revision.
 
 Follow `AGENTS.md` for `dbh` refreshes, merge/push verification, worktree cleanup, Streamient persistence, and applicable Managani changelog draft creation. Never publish or notify automatically.
 

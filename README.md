@@ -189,6 +189,10 @@ By default, the skill reads `model.json` in the skill folder (`~/.agents/skills/
 
 ## CLI Usage & Flags (`scripts/resolve-models.mjs`)
 
+Standalone Codex must use `--harness codex`; standalone Claude Code must use `--harness claude`. These restrictions apply to every role, including reviewers and budget workers. Explicit provider-only requests use the same flags even in T3 Code. Cross-family review never overrides the restriction: a single-family pool uses an independent reviewer from that family. An empty allowed pool is a blocker, not permission to switch providers.
+
+The CLI does not infer the host from environment variables (T3 can itself run Codex or Claude). Unscoped commands below are for hosts with cross-provider delegation; retain the appropriate `--harness` flag on every call in provider-only sessions.
+
 ```fish
 # Default (reads model.json + live T3 settings, OpenCode auth, and 7d usage telemetry)
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs
