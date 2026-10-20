@@ -54,7 +54,7 @@ Present one recommended plan covering:
 - **Approach, design decisions, and affected components.**
 - **Implementation steps, dependencies, and distinct file ownership.**
 - **Cost-Optimized Model Routing Table** showing:
-  - Current 7-day subscription headroom (`codex` % used vs `claudeAgent` % used) and active budget mode (`balanced`, `economy`, or `performance`).
+  - Subscription status and active budget mode. A plan of `0` means **No subscription**; a configured but disabled provider means **Provider disabled**. Report valid weekly quota as **X% used / Y% remaining**, including observation time, window duration, reset time, and source. Missing or expired quota is **usage unknown**. Never present local API-equivalent estimates as provider-reported quota or infer zero usage from missing telemetry.
   - Each planned subagent role, its tier (`@fast`, `@workhorse`, `@frontier`, `@reviewer`), exact `providerInstanceId:model`, billing type (`subscription` vs `api`), reasoning level, and why that tier is sufficient.
 - **Validation, frontend testing, and potential complications.**
 

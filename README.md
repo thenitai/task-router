@@ -24,6 +24,10 @@ Invoke in your agent:
 
 ---
 
+Set a provider's plan to `0` (for example, `"claude": 0` or `--plan claude=0`) to declare **No subscription** and exclude its subscription models. A configured subscription with a disabled runtime provider is reported separately as **Provider disabled**.
+
+Quota output includes used/remaining percentages, observation time, weekly window duration, reset time, and source file. The resolver compares event timestamps across session and archive files; missing or expired weekly readings remain unknown. Estimated local costs do not drive subscription headroom balancing or throttling. Explicit custom caps still use local usage for throttling.
+
 ## Setting Your Subscription Plans (`plans` & `--plan`)
 
 Instead of guessing weekly token or dollar limits, you simply declare your monthly subscription tiers in `model.json` (or via `--plan`):
@@ -45,11 +49,11 @@ node ~/.agents/skills/task-router/scripts/resolve-models.mjs --plan openai=20,cl
 
 | Provider | Monthly Plan (`plans`) | Weekly API-Equivalent Capacity | How Usage % Is Calculated |
 | :--- | :--- | :--- | :--- |
-| **OpenAI (`codex`)** | `200` (Pro $200/mo)<br>`20` (Plus $20/mo) | **~$1,750 / week eq**<br>**~$175 / week eq** | Reads OpenAI's **live server-reported `used_percent`** directly from your latest Codex rollout log (`~/.codex/sessions/...`) when on Pro, or divides your rolling 7-day token cost by the plan's weekly capacity. |
-| **Anthropic (`claude`)** | `200` (Max 20x $200/mo)<br>`100` (Max 5x $100/mo)<br>`20` (Pro $20/mo) | **~$1,500 / week eq**<br>**~$450 / week eq**<br>**~$90 / week eq** | Divides your rolling 7-day Claude token cost (`~/.t3/userdata/usage-scan-cache-v5.json`) by the plan's weekly capacity. |
+| **OpenAI (`codex`)** | `200` (Pro $200/mo)<br>`20` (Plus $20/mo) | **~$1,750 / week eq**<br>**~$175 / week eq** | Reads OpenAI's **live server-reported `used_percent`** directly from your latest Codex rollout log (`~/.codex/sessions/...`) for the explicitly identified weekly window, regardless of configured plan price. Missing or expired readings show **usage unknown**. |
+| **Anthropic (`claude`)** | `200` (Max 20x $200/mo)<br>`100` (Max 5x $100/mo)<br>`20` (Pro $20/mo) | **~$1,500 / week eq**<br>**~$450 / week eq**<br>**~$90 / week eq** | Reports **usage unknown** without provider quota telemetry. Local token costs are API-equivalent estimates, not subscription usage. |
 
 When `"spreadAcrossSubscriptions": true` (default):
-- If `codex` is at `44% used` and `claudeAgent` is at `5% used`, the router **automatically promotes `claudeAgent` (`claude-sonnet-5-5`) as Primary Implementer/Coordinator** and assigns `codex` (`gpt-6.1-sol`) to Secondary Parallel Slices until both subscriptions balance out.
+- When both providers have reported quota readings, if `codex` is at `44% used` and `claudeAgent` is at `5% used`, the router **automatically promotes `claudeAgent` (`claude-sonnet-5-5`) as Primary Implementer/Coordinator** and assigns `codex` (`gpt-6.1-sol`) to Secondary Parallel Slices until both subscriptions balance out.
 - If either provider reaches `autoDowngradeAbovePercent` (default `80%`), it is marked `THROTTLED` and demoted behind your other subscription and cheap Cloudflare Workers AI models (`deepseek-v4-pro-0813`, `glm-5.3`).
 
 ---

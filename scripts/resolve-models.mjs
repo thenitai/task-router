@@ -192,49 +192,37 @@ export function findLatestCodexRateLimits(homeDir = os.homedir(), fallbackFiles 
 	]);
 	if (candidates.size === 0) return null;
 
-	const scoredFiles = Array.from(candidates)
-		.map((filePath) => {
-			const base = path.basename(filePath);
-			const match = base.match(/rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})/);
-			const nameKey = match ? match[1] : "";
-			let mtimeMs = 0;
-			try {
-				mtimeMs = fs.statSync(filePath).mtimeMs;
-			} catch {}
-			return { filePath, nameKey, mtimeMs };
-		})
-		.sort((a, b) => b.nameKey.localeCompare(a.nameKey) || b.mtimeMs - a.mtimeMs)
-		.slice(0, 15);
-
 	let best = null;
-	for (const { filePath } of scoredFiles) {
+	for (const filePath of candidates) {
 		try {
-			const tail = fs.readFileSync(filePath, "utf8").trim().split("\n").slice(-50);
-			for (let i = tail.length - 1; i >= 0; i--) {
+			for (const line of fs.readFileSync(filePath, "utf8").split("\n")) {
+				if (!line.includes('"rate_limits"')) continue;
 				try {
-					const parsed = JSON.parse(tail[i]);
+					const parsed = JSON.parse(line);
 					const rl = parsed?.payload?.rate_limits;
-					if (!rl?.primary) continue;
-					const eventTsMs = parsed.timestamp ? Date.parse(parsed.timestamp) || 0 : 0;
-					const resetsAtSec = rl.primary.resets_at || 0;
-					if (!best || eventTsMs > best.eventTsMs || (eventTsMs === best.eventTsMs && resetsAtSec > best.resetsAtSec)) {
-						const windowMinutes = rl.primary.window_minutes || 10080;
-						const windowStartMs = resetsAtSec > 0 ? (resetsAtSec - windowMinutes * 60) * 1000 : null;
-						const expired = resetsAtSec > 0 && resetsAtSec * 1000 <= nowMs;
-						const rawBalance = parseFloat(rl.credits?.balance ?? "0");
-						best = {
-							planType: rl.plan_type || "pro",
-							usedPercent: expired ? 0 : rl.primary.used_percent,
-							windowMinutes,
-							resetsAtSec,
-							windowStartMs,
-							hasCredits: Boolean(rl.credits?.has_credits),
-							creditsBalance: Number.isNaN(rawBalance) ? 0 : Number(rawBalance.toFixed(2)),
-							rateLimitReached: Boolean(rl.rate_limit_reached_type || rl.spend_control_reached),
-							eventTsMs,
-						};
-					}
-					break;
+					if (!rl) continue;
+					// Model-specific limits must not replace the account-wide Codex quota.
+					if (rl.limit_id && rl.limit_id !== "codex") continue;
+					const eventTsMs = Date.parse(parsed.timestamp);
+					if (!Number.isFinite(eventTsMs) || eventTsMs > nowMs) continue;
+					if (best && eventTsMs <= best.eventTsMs) continue;
+					const window = [rl.primary, rl.secondary].find((w) => w?.window_minutes === 10080);
+					const resetsAtSec = window?.resets_at;
+					const valid = Number.isFinite(window?.used_percent) && window.used_percent >= 0 && window.used_percent <= 100
+						&& Number.isFinite(resetsAtSec) && resetsAtSec * 1000 > nowMs;
+					const rawBalance = Number(rl.credits?.balance ?? 0);
+					best = {
+						planType: rl.plan_type || null,
+						usedPercent: valid ? window.used_percent : null,
+						windowMinutes: window?.window_minutes ?? null,
+						resetsAtSec: Number.isFinite(resetsAtSec) ? resetsAtSec : null,
+						windowStartMs: valid ? (resetsAtSec - window.window_minutes * 60) * 1000 : null,
+						hasCredits: Boolean(rl.credits?.has_credits),
+						creditsBalance: Number.isFinite(rawBalance) ? rawBalance : 0,
+						rateLimitReached: Boolean(rl.rate_limit_reached_type || rl.spend_control_reached),
+						eventTsMs,
+						sourceFile: filePath,
+					};
 				} catch {}
 			}
 		} catch {}
@@ -251,14 +239,20 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 	const liveRateLimits = {};
 	const existingCodexFiles = [];
 
+	let cachedUsage = null;
 	if (fs.existsSync(usagePath)) {
 		try {
-			const data = JSON.parse(fs.readFileSync(usagePath, "utf8"));
-			for (const [filePath, fileEntry] of Object.entries(data.files || {})) {
+			cachedUsage = JSON.parse(fs.readFileSync(usagePath, "utf8"));
+			for (const [filePath, fileEntry] of Object.entries(cachedUsage.files || {})) {
 				if (fileEntry.p === "codex" && fs.existsSync(filePath)) existingCodexFiles.push(filePath);
 			}
-			const codexLive = findLatestCodexRateLimits(homeDir, existingCodexFiles, nowMs);
-			if (codexLive) liveRateLimits.codex = codexLive;
+		} catch {}
+	}
+	const codexLive = findLatestCodexRateLimits(homeDir, existingCodexFiles, nowMs);
+	if (codexLive) liveRateLimits.codex = codexLive;
+	if (cachedUsage) {
+		try {
+			const data = cachedUsage;
 			const codexWindowStartMs = codexLive?.windowStartMs ? Math.max(sevenDaysAgo, codexLive.windowStartMs) : sevenDaysAgo;
 
 			for (const [, fileEntry] of Object.entries(data.files || {})) {
@@ -313,9 +307,6 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 				}
 			}
 		} catch {}
-	} else {
-		const codexLive = findLatestCodexRateLimits(homeDir, [], nowMs);
-		if (codexLive) liveRateLimits.codex = codexLive;
 	}
 
 	const ocDbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
@@ -372,7 +363,7 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 		} catch {}
 	}
 
-	return Object.keys(byProvider).length > 0 ? { byProvider, byModel, liveRateLimits } : null;
+	return Object.keys(byProvider).length > 0 || Object.keys(liveRateLimits).length > 0 ? { byProvider, byModel, liveRateLimits } : null;
 }
 
 export function discoverRuntimeState(homeDir = os.homedir()) {
@@ -473,7 +464,7 @@ export function normalizePlans(rawPlans = {}) {
 	for (const [k, v] of Object.entries(rawPlans || {})) {
 		const prov = normalizeProvider(k);
 		const num = Number(String(v).replace(/^\$/, ""));
-		if (!Number.isNaN(num) && num > 0) out[prov] = num;
+		if (Number.isFinite(num) && num >= 0) out[prov] = num;
 	}
 	return out;
 }
@@ -524,35 +515,45 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	const throttledProviders = new Set();
 	const quotaStatus = {};
 	const subProviders = Object.keys(budgetCfg.weeklyLimitUsdEquivalent || {});
-	const enabledSubProviders = subProviders.filter((p) => !runtimeState?.disabledProviders?.has(p));
+	const enabledSubProviders = subProviders.filter((p) => plans[p] > 0 && !runtimeState?.disabledProviders?.has(p) && (!activeHarnesses || activeHarnesses.includes(p)));
 	for (const [prov, rawLimit] of Object.entries(budgetCfg.weeklyLimitUsdEquivalent || {})) {
+		if (plans[prov] === 0 || runtimeState?.disabledProviders?.has(prov)) {
+			quotaStatus[prov] = { planMonthlyUsd: plans[prov], status: plans[prov] === 0 ? "no-subscription" : "disabled", percentUsed: null, percentRemaining: null, throttled: false };
+			continue;
+		}
 		const isTokenLimit = typeof rawLimit === "string" && /[mk]$/i.test(rawLimit.trim());
 		const liveLimit = runtimeState?.usage?.liveRateLimits?.[prov];
-		const useWindowStats = Boolean(!isTokenLimit && liveLimit?.windowStartMs && runtimeState?.usage?.byProvider?.[prov]?.usdWindow !== undefined && !options.weeklyLimits?.[prov]);
+		const customLimit = options.weeklyLimits?.[prov] !== undefined || config?.budget?.weeklyLimitUsdEquivalent?.[prov] !== undefined;
+		const useWindowStats = Boolean(!isTokenLimit && liveLimit?.windowStartMs && runtimeState?.usage?.byProvider?.[prov]?.usdWindow !== undefined && !customLimit);
 		const spent7d = useWindowStats ? runtimeState.usage.byProvider[prov].usdWindow : (runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0);
 		const tokens7d = useWindowStats ? runtimeState.usage.byProvider[prov].tokensWindow : (runtimeState?.usage?.byProvider?.[prov]?.tokens7d ?? 0);
 		const limitVal = isTokenLimit ? (rawLimit.toLowerCase().endsWith("m") ? parseFloat(rawLimit) * 1e6 : parseFloat(rawLimit) * 1e3) : Number(String(rawLimit).replace(/^\$/, ""));
 		const currentVal = isTokenLimit ? tokens7d : spent7d;
-		let pct = limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : 0;
+		const estimatedPercentUsed = runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
+		const liveServerReported = !customLimit && Number.isFinite(liveLimit?.usedPercent);
+		const pct = liveServerReported ? liveLimit.usedPercent : customLimit ? estimatedPercentUsed : null;
 
-		if (!isTokenLimit && liveLimit?.usedPercent !== undefined && plans[prov] === 200 && !options.weeklyLimits?.[prov]) {
-			pct = liveLimit.usedPercent;
-		}
-
-		const hasCreditHeadroom = Boolean(liveLimit?.hasCredits && liveLimit?.creditsBalance > 0 && !liveLimit?.rateLimitReached && !options.weeklyLimits?.[prov] && !options.autoThrottle);
-		const isOnlyActiveSub = enabledSubProviders.length === 1 && enabledSubProviders[0] === prov && !options.weeklyLimits?.[prov] && !options.autoThrottle && !liveLimit?.rateLimitReached;
-		const overThreshold = pct >= budgetCfg.autoDowngradeAbovePercent;
+		const hasCreditHeadroom = Boolean(liveLimit?.hasCredits && liveLimit?.creditsBalance > 0 && !liveLimit?.rateLimitReached && !customLimit && !options.autoThrottle);
+		const isOnlyActiveSub = enabledSubProviders.length === 1 && enabledSubProviders[0] === prov && !customLimit && !options.autoThrottle && !liveLimit?.rateLimitReached;
+		const overThreshold = pct !== null && pct >= budgetCfg.autoDowngradeAbovePercent;
 		const throttled = Boolean(budgetCfg.autoThrottle && overThreshold && !hasCreditHeadroom && !isOnlyActiveSub);
 		if (throttled) throttledProviders.add(prov);
 		quotaStatus[prov] = {
-			planMonthlyUsd: plans[prov] || null,
+			planMonthlyUsd: plans[prov] ?? null,
+			status: "active",
 			unit: isTokenLimit ? "tokens" : "usd",
 			spent7dUsd: Number(spent7d.toFixed(2)),
 			tokens7dM: Number((tokens7d / 1e6).toFixed(1)),
 			weeklyLimit: rawLimit,
 			percentUsed: pct,
-			liveServerReported: Boolean(!isTokenLimit && liveLimit?.usedPercent !== undefined && plans[prov] === 200 && !options.weeklyLimits?.[prov]),
-			resetsAt: liveLimit?.resetsAtSec ? new Date(liveLimit.resetsAtSec * 1000).toISOString().slice(0, 10) : null,
+			percentRemaining: pct === null ? null : Math.max(0, 100 - pct),
+			estimatedPercentUsed,
+			customLimit,
+			liveServerReported,
+			observedAt: liveLimit?.eventTsMs ? new Date(liveLimit.eventTsMs).toISOString() : null,
+			windowMinutes: liveLimit?.windowMinutes ?? null,
+			sourceFile: liveLimit?.sourceFile ?? null,
+			resetsAt: liveLimit?.resetsAtSec ? new Date(liveLimit.resetsAtSec * 1000).toISOString() : null,
 			creditsBalance: liveLimit?.creditsBalance || null,
 			overThreshold,
 			throttled,
@@ -560,6 +561,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	}
 
 	const filtered = enriched.filter((model) => {
+		if (model.billing === "subscription" && plans[model.providerInstanceId] === 0) return false;
 		if (activeHarnesses && !activeHarnesses.includes(model.providerInstanceId)) return false;
 		if (model.providerInstanceId === "opencode" && model.id.includes("/")) {
 			const subProv = model.id.split("/")[0].toLowerCase();
@@ -607,9 +609,9 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 			return a.billing === "subscription" ? -1 : 1;
 		}
 		if (budgetCfg.spreadAcrossSubscriptions && a.billing === "subscription" && b.billing === "subscription" && a.providerInstanceId !== b.providerInstanceId) {
-			const aPct = quotaStatus[a.providerInstanceId]?.percentUsed ?? 0;
-			const bPct = quotaStatus[b.providerInstanceId]?.percentUsed ?? 0;
-			if (Math.abs(aPct - bPct) >= 10) return aPct - bPct;
+			const aPct = quotaStatus[a.providerInstanceId]?.percentUsed;
+			const bPct = quotaStatus[b.providerInstanceId]?.percentUsed;
+			if (Number.isFinite(aPct) && Number.isFinite(bPct) && Math.abs(aPct - bPct) >= 10) return aPct - bPct;
 		}
 		return effectiveCostScore(a) - effectiveCostScore(b);
 	};
@@ -670,6 +672,22 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	};
 }
 
+function formatQuotaStatus(resolved) {
+	const parts = Object.entries(resolved.quotaStatus).map(([prov, q]) => {
+		if (q.status === "no-subscription") return `\`${prov}\`: **No subscription**`;
+		if (q.status === "disabled") return `\`${prov}\` ($${q.planMonthlyUsd}/mo configured): **Provider disabled**`;
+		const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
+		const label = q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} eq (${q.tokens7dM}M tok)`;
+		const creditNote = q.creditsBalance ? `, ${Math.round(q.creditsBalance).toLocaleString("en-US")} credits/reset buffer` : "";
+		const resetNote = q.resetsAt ? `, resets ${q.resetsAt}` : "";
+		const observedNote = q.observedAt ? `, observed ${q.observedAt}, window ${q.windowMinutes ?? "unknown"} minutes` : "";
+		const sourceNote = q.sourceFile ? `, source: \`${q.sourceFile}\`` : "";
+		const usage = q.percentUsed === null ? "usage unknown" : `${q.percentUsed}% used / ${q.percentRemaining}% remaining (${q.customLimit ? "custom cap" : "server-reported"})`;
+		return `\`${prov}\` (${planTag}): **${usage}**${creditNote}${observedNote}${resetNote}${sourceNote}; local API-equivalent estimate: ${label}${q.throttled ? " **[THROTTLED]**" : ""}`;
+	});
+	return `- **7-Day Subscription Headroom:** ${parts.join(" | ")}`;
+}
+
 export function formatMarkdown(resolved) {
 	const lines = [
 		`### Active Model Pool (Mode: \`${resolved.budget?.mode || "balanced"}\`)`,
@@ -678,16 +696,7 @@ export function formatMarkdown(resolved) {
 	if (resolved.disabledProviders?.length) {
 		lines.push(`- **Disabled T3 Providers (skipped):** \`${resolved.disabledProviders.join("`, `")}\``);
 	}
-	if (Object.keys(resolved.quotaStatus || {}).length) {
-		const parts = Object.entries(resolved.quotaStatus).map(([prov, q]) => {
-			const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
-			const label = q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} eq (${q.tokens7dM}M tok)`;
-			const creditNote = q.creditsBalance ? `, ${Math.round(q.creditsBalance).toLocaleString("en-US")} credits/reset buffer` : "";
-			const resetNote = q.resetsAt ? `, resets ${q.resetsAt}` : "";
-			return `\`${prov}\` (${planTag}): ${label} -> **${q.percentUsed}% used**${creditNote}${resetNote}${q.throttled ? " **[THROTTLED]**" : ""}`;
-		});
-		lines.push(`- **7-Day Subscription Headroom:** ${parts.join(" | ")}`);
-	}
+	lines.push(formatQuotaStatus(resolved));
 	lines.push("");
 	lines.push("| Capability Tier | Provider | Model ID | Billing | Cost ($/M In/Out/Cache) | Reasoning | Family |");
 	lines.push("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |");
@@ -728,7 +737,7 @@ export function formatMarkdown(resolved) {
 
 export function formatUsageReport(runtimeState, resolved) {
 	const usage = runtimeState?.usage;
-	if (!usage) return "No local usage telemetry found.";
+	if (!usage) return `${formatQuotaStatus(resolved)}\n\nNo local usage telemetry found.`;
 
 	const models = Object.values(usage.byModel || {}).sort((a, b) => b.usdTotal - a.usdTotal);
 	const totalTurns7d = models.reduce((s, m) => s + m.turns7d, 0) || 1;
@@ -737,6 +746,7 @@ export function formatUsageReport(runtimeState, resolved) {
 
 	const lines = [
 		"## Task-Router Usage, Cost & Subscription ROI Report",
+		formatQuotaStatus(resolved),
 		"",
 		"### 1. Per-Model Breakdown (Rolling 7 Days & All-Time)",
 		"",
@@ -766,11 +776,11 @@ export function formatUsageReport(runtimeState, resolved) {
 
 	lines.push("");
 	lines.push("### 2. Subscription Plan Simulator (Based on Your Actual 7-Day Workload)");
-	lines.push(`- **Current 7d Codex burn (with Astra as Coordinator):** **$${currentCodex7d.toFixed(2)}/wk eq** (Server-reported: **${usage.liveRateLimits?.codex?.usedPercent ?? "?"}%** of $200 Pro weekly limit)`);
-	lines.push(`- **Optimized 7d burn (replacing Astra Coordinator with \`gpt-6.1-sol\` / \`claude-sonnet-5-5\`):** **$${optimizedCodex7d.toFixed(2)}/wk eq** (**-${Math.round((1 - optimizedCodex7d / Math.max(currentCodex7d, 1)) * 100)}% quota burn** for the exact same ${ (totalTok7d / 1e6).toFixed(0) }M tokens!)`);
+	lines.push(`- **Current 7d Codex burn (with Astra as Coordinator):** **$${currentCodex7d.toFixed(2)}/wk eq**`);
+	lines.push(`- **Optimized 7d burn (replacing Astra Coordinator with \`gpt-6.1-sol\` / \`claude-sonnet-5-5\`):** **$${optimizedCodex7d.toFixed(2)}/wk eq** (**-${Math.round((1 - optimizedCodex7d / Math.max(currentCodex7d, 1)) * 100)}% estimated API-equivalent cost** for the exact same ${ (totalTok7d / 1e6).toFixed(0) }M tokens!)`);
 	lines.push("");
 	lines.push("| Plan Option | Monthly Cost | Combined Weekly Capacity (Eq) | Est. Weekly Usage (Optimized) | Verdict |", "| :--- | :--- | :--- | :--- | :--- |");
-	lines.push(`| \`openai=200\` (Current) | $200/mo | ~$1,750/wk eq | ~${Math.round((optimizedCodex7d / 1750) * 100)}% used | Huge headroom, no second sub needed unless for Claude review |`);
+	lines.push(`| \`openai=200\` | $200/mo | ~$1,750/wk eq | ~${Math.round((optimizedCodex7d / 1750) * 100)}% used | Huge headroom, no second sub needed unless for Claude review |`);
 	lines.push(`| \`openai=20, claude=100\` | **$120/mo** | ~$625/wk eq ($175 + $450) | **~${Math.round((optimizedCodex7d / 625) * 100)}% used** | **Best Value / Sweet Spot** — saves $80/mo + gives cross-family Opus/Sonnet |`);
 	lines.push(`| \`openai=20, claude=20\` | $40/mo | ~$265/wk eq ($175 + $90) | ~${Math.round((optimizedCodex7d / 265) * 100)}% used | Tight on heavy weeks (${Math.round(totalTurns7d)} turns/wk); requires offloading ~40% to DeepSeek/GLM |`);
 	lines.push(`| Pay-per-token Google API (\`gemini-4-argon\`) | **~$${Math.round(googleArgonWeeklyApiCost * 4.3)}/mo** ($${googleArgonWeeklyApiCost.toFixed(0)}/wk) | Unlimited (billed per token) | 100% billed | **More expensive than subscriptions** at ${(total7dCacheTok / 1e6).toFixed(0)}M cached tokens/wk |`);

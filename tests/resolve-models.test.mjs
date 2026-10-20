@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { formatMarkdown, formatUsageReport, planToWeeklyLimitUsd, resolveModels } from "../scripts/resolve-models.mjs";
+import { findLatestCodexRateLimits, scanUsageTelemetry, normalizePlans, formatMarkdown, formatUsageReport, planToWeeklyLimitUsd, resolveModels } from "../scripts/resolve-models.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultConfig = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "model.json"), "utf8"));
@@ -173,7 +174,7 @@ test("maps monthly plans (openai=200, claude=100) to weekly capacity and load-ba
 			byModel: {
 				"codex:gpt-6.1-sol": { provider: "codex", model: "gpt-6.1-sol", billing: "subscription", usd7d: 90, usdTotal: 90, tokens7d: 150_000_000, tokensTotal: 150_000_000, inTok7d: 2_000_000, cacheRead7d: 147_000_000, outTok7d: 1_000_000, turns7d: 1000, turnsTotal: 1000 },
 			},
-			liveRateLimits: {},
+			liveRateLimits: { codex: { usedPercent: 51 }, claudeAgent: { usedPercent: 4 } },
 		},
 	};
 	const resolved = resolveModels(defaultConfig, undefined, null, runtimeState, { plans: { codex: 20, claudeAgent: 100 } });
@@ -187,4 +188,70 @@ test("maps monthly plans (openai=200, claude=100) to weekly capacity and load-ba
 	const report = formatUsageReport(runtimeState, resolved);
 	assert.ok(report.includes("Subscription Plan Simulator"));
 	assert.ok(report.includes("openai=20, claude=100"));
+});
+
+test("zero plans mean no subscription; disabled providers remain distinct", () => {
+	assert.deepEqual(normalizePlans({ openai: 200, claude: 0, invalid: -1, infinite: Infinity }), { codex: 200, claudeAgent: 0 });
+	for (const options of [{}, { plans: { claude: 0 } }]) {
+		const resolved = resolveModels({ ...defaultConfig, plans: { openai: 200, claude: 0 } }, undefined, null, null, options);
+		assert.equal(resolved.plans.claudeAgent, 0);
+		assert.equal(resolved.quotaStatus.claudeAgent.percentUsed, null);
+		assert.ok(resolved.models.every((m) => m.providerInstanceId !== "claudeAgent"));
+		assert.ok(formatMarkdown(resolved).includes("No subscription"));
+		assert.ok(formatUsageReport(null, resolved).includes("No subscription"));
+	}
+	const disabled = resolveModels(defaultConfig, undefined, null, { disabledProviders: new Set(["claudeAgent"]) });
+	assert.equal(disabled.quotaStatus.claudeAgent.status, "disabled");
+	assert.ok(formatMarkdown(disabled).includes("Provider disabled"));
+});
+
+test("unknown quota is not zero; cost estimates do not claim subscription usage", () => {
+	const resolved = resolveModels(defaultConfig, undefined, null, { usage: { byProvider: { codex: { usd7d: 1750, tokens7d: 100 } } } });
+	assert.equal(resolved.quotaStatus.codex.percentUsed, null);
+	assert.equal(resolved.quotaStatus.codex.estimatedPercentUsed, 100);
+	assert.equal(resolved.quotaStatus.codex.throttled, false);
+	assert.ok(formatMarkdown(resolved).includes("usage unknown"));
+	assert.ok(formatMarkdown(resolved).includes("local API-equivalent estimate"));
+});
+
+test("finds newest weekly event across older sessions and beyond the tail, without a usage cache", (t) => {
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "router-quota-"));
+	t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+	const dir = path.join(home, ".codex", "sessions");
+	fs.mkdirSync(dir, { recursive: true });
+	const now = Date.parse("2026-10-20T12:00:00Z");
+	const reset = now / 1000 + 86400;
+	const event = (ts, weekly, extra = {}) => JSON.stringify({ timestamp: new Date(ts).toISOString(), payload: { rate_limits: {
+		primary: { used_percent: 49, window_minutes: 300, resets_at: reset },
+		secondary: { used_percent: weekly, window_minutes: 10080, resets_at: reset }, ...extra,
+	} } });
+	for (let i = 1; i <= 20; i++) fs.writeFileSync(path.join(dir, `rollout-2026-10-${String(i).padStart(2, "0")}T00-00-00.jsonl`), event(now - 10000, 49));
+	const source = path.join(dir, "rollout-2026-01-01T00-00-00.jsonl");
+	fs.writeFileSync(source, event(now - 1000, 1) + "\n" + "{}\n".repeat(100) + "{broken\n" + event(now, 99, { limit_id: "model-specific" }));
+	const reading = findLatestCodexRateLimits(home, [], now);
+	assert.equal(reading.usedPercent, 1);
+	assert.equal(reading.sourceFile, source);
+	assert.equal(reading.windowMinutes, 10080);
+	const usage = scanUsageTelemetry(home, now);
+	assert.equal(usage.liveRateLimits.codex.usedPercent, 1);
+	const cacheDir = path.join(home, ".t3", "userdata");
+	fs.mkdirSync(cacheDir, { recursive: true });
+	fs.writeFileSync(path.join(cacheDir, "usage-scan-cache-v5.json"), "{broken");
+	assert.equal(scanUsageTelemetry(home, now).liveRateLimits.codex.usedPercent, 1);
+
+	const resolved = resolveModels(defaultConfig, undefined, null, { usage });
+	assert.equal(resolved.quotaStatus.codex.percentRemaining, 99);
+	const md = formatMarkdown(resolved);
+	assert.ok(md.includes("1% used / 99% remaining"));
+	assert.ok(md.includes("2026-10-20T11:59:59.000Z"));
+	assert.ok(md.includes(source));
+	assert.ok(formatUsageReport({ usage }, resolved).includes("1% used / 99% remaining"));
+	fs.writeFileSync(source, event(now, 99, { primary: { used_percent: 1, window_minutes: 10080, resets_at: reset }, secondary: null }));
+	assert.equal(findLatestCodexRateLimits(home, [], now).usedPercent, 1, "weekly window can also be primary");
+
+	assert.equal(findLatestCodexRateLimits(home, [], now + 2 * 86400000).usedPercent, null);
+	fs.writeFileSync(source, event(now, 1, { secondary: null }));
+	assert.equal(findLatestCodexRateLimits(home, [], now).usedPercent, null, "a newer event without weekly data must not revive an older reading");
+	fs.writeFileSync(source, event(now, -1));
+	assert.equal(findLatestCodexRateLimits(home, [], now).usedPercent, null);
 });
