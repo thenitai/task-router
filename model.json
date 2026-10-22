@@ -6,8 +6,8 @@
     "respectRuntimeSettings": true
   },
   "plans": {
-    "openai": 200,
-    "claude": 100
+    "openai": 20,
+    "claude": 20
   },
   "budget": {
     "mode": "balanced",
@@ -18,13 +18,13 @@
     "autoThrottle": true,
     "autoDowngradeAbovePercent": 80
   },
-  "select": [
+  "models": [
     "codex:all",
 
     "claude:all",
     "claude:!fable",
 
-    "opencode:glm-5.3*, kimi-k3, deepseek-v4*"
+    "opencode:glm-5.3*"
   ],
   "reasoning": {
     "coordinator": "medium",

@@ -4,7 +4,7 @@ Cost-aware, adaptive multi-model planning and subagent orchestration skill for *
 
 `task-router` replaces hardcoded model names in planning prompts with a dynamic resolver (`scripts/resolve-models.mjs`) backed by `model.json` and your live local runtime settings:
 1. **Resolves active models and gateways** from your live installations (`codex`, `claudeAgent`, `opencode`), skipping disabled T3 providers, hidden models, and unauthenticated gateways.
-2. **Understands your monthly subscription plans (`openai=200, claude=100`)**, reads live server-reported quota % from Codex session logs, and **automatically spreads work across subscriptions** toward whichever provider has more remaining weekly headroom.
+2. **Understands your monthly subscription plans (default `openai=20, claude=20`)**, reads live server-reported quota % from Codex session logs, and **automatically spreads work across subscriptions** toward whichever provider has more remaining weekly headroom.
 3. **Protects subscriptions over paid APIs** by prioritizing direct subscriptions (`codex`, `claudeAgent`) and blocking duplicate per-token API charges (`openai/*`, `anthropic/*` inside OpenCode).
 4. **Generates Usage, Cost & Subscription ROI Reports (`--report`)** across T3 (`~/.t3/userdata/usage-scan-cache-v5.json`) and OpenCode (`~/.local/share/opencode/opencode.db`), including a **Plan Simulator** comparing `$200`, `$120 ($20+$100)`, `$40 ($20+$20)`, and pay-per-token Google API.
 
@@ -30,12 +30,14 @@ Quota output includes used/remaining percentages, a separate credit balance, obs
 
 ## Setting Your Subscription Plans (`plans` & `--plan`)
 
-Instead of guessing weekly token or dollar limits, you simply declare your monthly subscription tiers in `model.json` (or via `--plan`):
+Instead of guessing weekly token or dollar limits, you simply declare your monthly subscription tiers in `~/.config/task-router/user.json` (or via `--plan`):
 
 ```json
-"plans": {
-  "openai": 200,
-  "claude": 100
+{
+  "plans": {
+    "openai": 20,
+    "claude": 20
+  }
 }
 ```
 
@@ -86,15 +88,17 @@ Example output:
 
 ## Configuration Reference (`model.json`)
 
-The skill always loads bundled `model.json` as defaults, then merges one optional personal override. Keep only your changes in **`~/.config/task-router/model.json`**, outside the installed skill so updates preserve them:
+The skill always loads bundled `model.json` as defaults, then merges one optional personal override. Keep only your changes in **`~/.config/task-router/user.json`**, outside the installed skill so updates preserve them:
 
 ```json
 {"plans":{"openai":200}}
 ```
 
-Omitted settings inherit the bundled defaults, including the Claude $100 plan. Set `"claude": 0` explicitly if you have no Claude subscription. Nested objects merge; arrays (including `select`) and scalar values replace the corresponding default. An empty array clears a default list.
+Omitted settings inherit the bundled defaults, including both $20 plans. Set `"claude": 0` explicitly if you have no Claude subscription. Nested objects merge; arrays (including `models`) and scalar values replace the corresponding default. An empty array clears a default list.
 
-The first existing personal file wins, in this order: `~/.config/task-router/model.json`, `~/.config/task-router/models.json`, `~/.codex/task-router/model.json`, `~/.codex/task-router/models.json`. Lower-priority files are not merged. `--config /path/to/file.json` selects that override instead of autodiscovery; CLI flags apply last. Missing explicit files and invalid JSON produce an error that names the file. A legacy bundled `models.json` is supported when bundled `model.json` is absent.
+Create the directory with `mkdir -p ~/.config/task-router`, then save your overrides as `user.json`. The example above changes only OpenAI to $200; Claude stays at $20. To change model rules, add a `"models"` array using the same provider patterns as the defaults below; the array replaces the entire default list.
+
+The first existing personal file wins, in this order: `~/.config/task-router/user.json`, `~/.codex/task-router/user.json`, `~/.config/task-router/model.json`, `~/.config/task-router/models.json`, `~/.codex/task-router/model.json`, `~/.codex/task-router/models.json`. Lower-priority files are not merged. `--config /path/to/file.json` selects that override instead of autodiscovery; CLI flags apply last. Missing explicit files and invalid JSON produce an error that names the file. Existing personal `model.json`/`models.json` files and the legacy `select` key remain supported. Within a file, `models` takes precedence over `select`. A legacy bundled `models.json` is supported when bundled `model.json` is absent.
 
 ### Full Default `model.json`
 
@@ -107,8 +111,8 @@ The first existing personal file wins, in this order: `~/.config/task-router/mod
     "respectRuntimeSettings": true
   },
   "plans": {
-    "openai": 200,
-    "claude": 100
+    "openai": 20,
+    "claude": 20
   },
   "budget": {
     "mode": "balanced",
@@ -119,13 +123,13 @@ The first existing personal file wins, in this order: `~/.config/task-router/mod
     "autoThrottle": true,
     "autoDowngradeAbovePercent": 80
   },
-  "select": [
+  "models": [
     "codex:all",
 
     "claude:all",
     "claude:!fable",
 
-    "opencode:glm-5.3*, kimi-k3, deepseek-v4*"
+    "opencode:glm-5.3*"
   ],
   "reasoning": {
     "coordinator": "medium",
@@ -143,8 +147,8 @@ The first existing personal file wins, in this order: `~/.config/task-router/mod
 
 | Setting | Type | Default | Description & Example |
 | :--- | :--- | :--- | :--- |
-| `openai` | `number` (`20` \| `200`) | `200` | Monthly OpenAI subscription tier in USD (`200` for Pro, `20` for Plus). Automatically sets `codex` weekly capacity (`$1,750/wk eq` for `$200`, `$175/wk eq` for `$20`).<br>**Example:** `"openai": 20` |
-| `claude` | `number` (`20` \| `100` \| `200`) | `100` | Monthly Anthropic Claude subscription tier in USD (`200` for Max 20x, `100` for Max 5x, `20` for Pro). Automatically sets `claudeAgent` weekly capacity (`$1,500/wk eq`, `$450/wk eq`, `$90/wk eq`).<br>**Example:** `"claude": 100` |
+| `openai` | `number` (`20` \| `200`) | `20` | Monthly OpenAI subscription tier in USD (`200` for Pro, `20` for Plus). Automatically sets `codex` weekly capacity (`$1,750/wk eq` for `$200`, `$175/wk eq` for `$20`).<br>**Example:** `"openai": 20` |
+| `claude` | `number` (`20` \| `100` \| `200`) | `20` | Monthly Anthropic Claude subscription tier in USD (`200` for Max 20x, `100` for Max 5x, `20` for Pro). Automatically sets `claudeAgent` weekly capacity (`$1,500/wk eq`, `$450/wk eq`, `$90/wk eq`).<br>**Example:** `"claude": 20` |
 
 ---
 
@@ -163,7 +167,7 @@ The first existing personal file wins, in this order: `~/.config/task-router/mod
 
 | Setting | Type | Default | Description & Example |
 | :--- | :--- | :--- | :--- |
-| `mode` | `"balanced" \| "economy" \| "performance"` | `"balanced"` | Controls how models are ranked inside each tier:<br>• `"balanced"` — Subscription `@workhorse` (`gpt-6.1-sol` / `claude-sonnet-5-5`) as Coordinator & primary implementer; `@fast` & open-weight models for recon/boilerplate.<br>• `"economy"` — Sorts every tier strictly by lowest $/M token cost (`deepseek-v4-pro-0813` and `glm-5.3` first for workhorse; `gpt-6-luna` / `glm-5.3-flash` first for fast; lowers workhorse reasoning to `low`/`medium`).<br>• `"performance"` — Promotes `@frontier` (`claude-opus-5-5`, `gpt-6-astra`) to the top of coordinator and review pools.<br>**Example:** `"mode": "economy"` |
+| `mode` | `"balanced" \| "economy" \| "performance"` | `"balanced"` | Controls how models are ranked inside each tier:<br>• `"balanced"` — Subscription `@workhorse` (`gpt-6.1-sol` / `claude-sonnet-5-5`) as Coordinator & primary implementer; `@fast` & open-weight models for recon/boilerplate.<br>• `"economy"` — Sorts every tier strictly by lowest $/M token cost (only configured models participate; `gpt-6-luna` / `glm-5.3-flash` first for fast; lowers workhorse reasoning to `low`/`medium`).<br>• `"performance"` — Promotes `@frontier` (`claude-opus-5-5`, `gpt-6-astra`) to the top of coordinator and review pools.<br>**Example:** `"mode": "economy"` |
 | `coordinatorTier` | `"workhorse" \| "frontier"` | `"workhorse"` | Selects the tier used for the main Coordinator session. Keeping this as `"workhorse"` (`gpt-6.1-sol` or `claude-sonnet-5-5`) saves **~8–10x cached-token burn** compared to running `gpt-6-astra` as Coordinator.<br>**Example:** `"coordinatorTier": "workhorse"` |
 | `preferSubscriptionOverApi` | `boolean` | `true` | In `"balanced"` mode, ranks flat-rate `subscription` providers (`codex`, `claudeAgent`) ahead of per-token `api` gateways (`opencode`) within the same tier.<br>**Example:** `"preferSubscriptionOverApi": true` |
 | `spreadAcrossSubscriptions` | `boolean` | `true` | Dynamically load-balances between `codex` and `claudeAgent` based on which subscription has lower reported weekly % usage (when they differ by ≥10%). Percentage balancing is skipped when either provider has usable credit headroom.<br>**Example:** `"spreadAcrossSubscriptions": true` |
@@ -174,15 +178,15 @@ The first existing personal file wins, in this order: `~/.config/task-router/mod
 
 ---
 
-### 4. `select` & `reasoning` Examples
+### 4. `models` & `reasoning` Examples
 
 ```json
-  "select": [
+  "models": [
     "codex:all",
     "codex:!luna",
     "claude:all",
     "claude:!fable",
-    "opencode:glm-5.3*, kimi-k3, deepseek-v4*"
+    "opencode:glm-5.3*"
   ],
   "reasoning": {
     "coordinator": "medium",

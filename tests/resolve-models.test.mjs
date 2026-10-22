@@ -12,6 +12,9 @@ const defaultConfig = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "mod
 
 test("default model.json resolves expected models and excludes claude-fable and legacy models", () => {
 	const resolved = resolveModels(defaultConfig);
+	assert.deepEqual(resolved.plans, { codex: 20, claudeAgent: 20 });
+	assert.deepEqual(resolveModels({ models: defaultConfig.models }).plans, resolved.plans);
+	assert.ok(!Object.hasOwn(defaultConfig, "select"));
 	const ids = resolved.models.map((m) => m.id);
 	assert.ok(ids.includes("gpt-6-astra"), "includes gpt-6-astra");
 	assert.ok(ids.includes("gpt-6.1-sol"), "includes gpt-6.1-sol");
@@ -27,9 +30,9 @@ test("default model.json resolves expected models and excludes claude-fable and 
 	assert.ok(!ids.includes("opencode/gemini-3.8-flash"), "excludes opencode/gemini-3.8-flash after removing gemini from model.json");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3"), "includes cloudflare-workers-ai glm-5.3");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash"), "includes cloudflare-workers-ai glm-5.3-flash");
-	assert.ok(ids.includes("opencode/kimi-k3"), "includes opencode/kimi-k3");
-	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813"), "includes cloudflare-workers-ai deepseek-v4-pro");
-	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"), "includes cloudflare-workers-ai deepseek-v4-flash");
+	assert.ok(!ids.includes("opencode/kimi-k3"), "excludes Kimi by default");
+	assert.ok(!ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813"), "excludes DeepSeek Pro by default");
+	assert.ok(!ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"), "excludes DeepSeek Flash by default");
 });
 
 test("recommends workhorse coordinator (not gpt-6-astra) in balanced mode and blocks OpenCode openai/anthropic API duplicates", () => {
@@ -40,7 +43,7 @@ test("recommends workhorse coordinator (not gpt-6-astra) in balanced mode and bl
 		{ providerInstanceId: "opencode", id: "openai/gpt-6.1-sol", label: "GPT-6.1 Sol (API)" },
 		{ providerInstanceId: "opencode", id: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813", label: "DeepSeek V4 Pro" },
 	];
-	const cfg = { ...defaultConfig, select: ["codex:all", "opencode:all"] };
+	const cfg = { ...defaultConfig, models: ["codex:all", "opencode:all"] };
 	const resolved = resolveModels(cfg, catalog);
 	const ids = resolved.models.map((m) => `${m.providerInstanceId}:${m.id}`);
 	assert.ok(!ids.includes("opencode:anthropic/claude-sonnet-5-5"), "blocks paid anthropic API via opencode");
@@ -74,7 +77,7 @@ test("throttles a provider when 7-day spend or token volume exceeds weekly limit
 	assert.equal(tokenResolved.quotaStatus.claudeAgent.throttled, false, "claudeAgent is not throttled at 15M / 300M tokens");
 
 	const economy = resolveModels(defaultConfig, undefined, null, null, { budgetMode: "economy" });
-	assert.equal(economy.recommended.primaryImplementer.id, "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813", "economy mode picks cheapest workhorse first");
+	assert.equal(economy.recommended.primaryImplementer.id, "gpt-6.1-sol", "economy mode picks cheapest workhorse first");
 });
 
 test("skips disabled T3 providers and respects hiddenModels + connected OpenCode gateways", () => {
@@ -99,11 +102,11 @@ test("skips disabled T3 providers and respects hiddenModels + connected OpenCode
 	assert.ok(!ids.includes("opencode/glm-5.3"), "skips hidden opencode/glm-5.3");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3"), "selects connected cloudflare-workers-ai glm-5.3");
 	assert.ok(!ids.includes("github-copilot/gemini-4-argon"), "skips unauthenticated github-copilot gateway");
-	assert.ok(!ids.includes("google/gemini-4-argon"), "excludes google/gemini-4-argon when not in select");
+	assert.ok(!ids.includes("google/gemini-4-argon"), "excludes google/gemini-4-argon when not in models");
 	assert.equal(resolved.recommended.crossFamilyReviewer.id, "cloudflare-workers-ai/@cf/zai-org/glm-5.3", "falls back reviewer to cross-family OpenCode workhorse when Claude is disabled and Gemini is excluded");
 });
 
-test("uses post-reset window stats and does not throttle $200 OpenAI Pro plan when credits/resets remain", () => {
+test("uses post-reset window stats and does not throttle when credits/resets remain", () => {
 	const runtimeState = {
 		disabledProviders: new Set(["claudeAgent"]),
 		hiddenModelsByProvider: new Map(),
@@ -233,7 +236,7 @@ test("zero plans mean no subscription; disabled providers remain distinct", () =
 });
 
 test("unknown quota is not zero; cost estimates do not claim subscription usage", () => {
-	const resolved = resolveModels(defaultConfig, undefined, null, { usage: { byProvider: { codex: { usd7d: 1750, tokens7d: 100 } } } });
+	const resolved = resolveModels(defaultConfig, undefined, null, { usage: { byProvider: { codex: { usd7d: 175, tokens7d: 100 } } } });
 	assert.equal(resolved.quotaStatus.codex.percentUsed, null);
 	assert.equal(resolved.quotaStatus.codex.estimatedPercentUsed, 100);
 	assert.equal(resolved.quotaStatus.codex.throttled, false);
@@ -334,7 +337,7 @@ test("credits bypass quota demotion, while explicit caps and throttle still win"
 	}
 	const cfg = { ...defaultConfig, budget: { ...defaultConfig.budget, weeklyLimitUsdEquivalent: { codex: 100 } } };
 	assert.equal(resolveModels(cfg, undefined, null, runtime()).quotaStatus.codex.throttled, true);
-	assert.equal(resolveModels(cfg).quotaStatus.claudeAgent.weeklyLimit, 450, "a custom cap retains other derived limits");
+	assert.equal(resolveModels(cfg).quotaStatus.claudeAgent.weeklyLimit, 90, "a custom cap retains other derived limits");
 });
 
 test("credit telemetry preserves zero versus unknown and never revives an older balance", (t) => {
@@ -373,26 +376,26 @@ test("personal configuration merges defaults and respects path precedence", (t) 
 		return file;
 	};
 	assert.deepEqual(loadConfig(null, home), defaultConfig);
-	const candidates = [".config/task-router/model.json", ".config/task-router/models.json", ".codex/task-router/model.json", ".codex/task-router/models.json"];
+	const candidates = [".config/task-router/user.json", ".codex/task-router/user.json", ".config/task-router/model.json", ".config/task-router/models.json", ".codex/task-router/model.json", ".codex/task-router/models.json"];
 	for (const [index, candidate] of candidates.entries()) write(candidate, { plans: { openai: 20 + index }, reasoning: { fast: "low" } });
 	for (const [index, candidate] of candidates.entries()) {
 		const cfg = loadConfig(null, home);
 		assert.equal(cfg.plans.openai, 20 + index);
-		assert.equal(cfg.plans.claude, 100);
-		assert.deepEqual(cfg.select, defaultConfig.select);
+		assert.equal(cfg.plans.claude, 20);
+		assert.deepEqual(cfg.models, defaultConfig.models);
 		assert.equal(cfg.reasoning.fast, "low");
 		assert.equal(cfg.reasoning.frontier, defaultConfig.reasoning.frontier);
 		assert.ok(resolveModels(cfg).models.length > 0);
 		fs.unlinkSync(path.join(home, candidate));
 	}
-	write(candidates[0], { plans: { openai: 500 }, select: [] });
+	write(candidates[0], { plans: { openai: 500 }, models: [] });
 	const custom = write("custom.json", { plans: { openai: 20, claude: 0 }, budget: { mode: "economy", autoThrottle: false } });
 	const cfg = loadConfig(custom, home);
 	assert.equal(cfg.plans.openai, 20);
 	assert.equal(cfg.budget.mode, "economy");
 	assert.equal(cfg.budget.preferSubscriptionOverApi, true);
 	assert.equal(cfg.budget.autoThrottle, false);
-	assert.deepEqual(cfg.select, defaultConfig.select, "explicit config ignores discovered personal file");
+	assert.deepEqual(cfg.models, defaultConfig.models, "explicit config ignores discovered personal file");
 	assert.ok(resolveModels(cfg).models.every((m) => m.providerInstanceId !== "claudeAgent"));
 	const cli = JSON.parse(execFileSync(process.execPath, [path.join(__dirname, "..", "scripts", "resolve-models.mjs"), "--config", custom, "--static", "--json", "--budget", "performance", "--plan", "openai=200", "--weekly-limit", "codex=25", "--throttle"], { encoding: "utf8" }));
 	assert.equal(cli.plans.codex, 200);
@@ -402,9 +405,18 @@ test("personal configuration merges defaults and respects path precedence", (t) 
 	for (const args of [["--config"], ["--config", "--static"]]) {
 		assert.throws(() => execFileSync(process.execPath, [path.join(__dirname, "..", "scripts", "resolve-models.mjs"), ...args], { stdio: "pipe" }), /--config requires a file path/);
 	}
-	const arrays = write("arrays.json", { select: [], budget: { blockApiSubproviders: [] } });
-	assert.deepEqual(loadConfig(arrays, home).select, []);
+	const arrays = write("arrays.json", { models: [], budget: { blockApiSubproviders: [] } });
+	assert.deepEqual(loadConfig(arrays, home).models, []);
 	assert.deepEqual(loadConfig(arrays, home).budget.blockApiSubproviders, []);
+	const legacy = write("legacy.json", { select: ["opencode:glm-5.3*"] });
+	const legacyConfig = loadConfig(legacy, home);
+	assert.deepEqual(legacyConfig.models, ["opencode:glm-5.3*"]);
+	assert.ok(!Object.hasOwn(legacyConfig, "select"));
+	assert.ok(resolveModels(legacyConfig).models.every((m) => m.providerInstanceId === "opencode"));
+	assert.ok(resolveModels({ select: ["codex:all"] }).models.every((m) => m.providerInstanceId === "codex"));
+	const both = write("both.json", { models: [], select: ["codex:all"] });
+	assert.deepEqual(resolveModels(loadConfig(both, home)).models, []);
+	assert.deepEqual(resolveModels({ models: [], select: ["codex:all"] }).models, []);
 	const nestedDefaults = write("bundle/models.json", { budget: { weeklyLimitUsdEquivalent: { codex: 50, claudeAgent: 100 } } });
 	const nested = write("nested.json", { budget: { weeklyLimitUsdEquivalent: { codex: 25 } } });
 	assert.deepEqual(loadConfig(nested, home, path.dirname(nestedDefaults)).budget.weeklyLimitUsdEquivalent, { codex: 25, claudeAgent: 100 });

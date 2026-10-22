@@ -1,6 +1,6 @@
 ---
 name: task-router
-description: Act as the planner, cost-aware adaptive multi-model router, and subagent coordinator for software tasks. Investigates read-only, resolves active models, subscription plans (openai=200, claude=100), and rolling 7-day quota burn from model.json and local telemetry, load-balances across subscriptions while offloading routine work to fast/open-weight models, presents a routing plan with a hard approval gate, and orchestrates implementation, independent review within the allowed provider pool, frontend testing, and git integration.
+description: Act as the planner, cost-aware adaptive multi-model router, and subagent coordinator for software tasks. Investigates read-only, resolves active models, subscription plans (default openai=20, claude=20), and rolling 7-day quota burn from model.json and local telemetry, load-balances across subscriptions while offloading routine work to fast/open-weight models, presents a routing plan with a hard approval gate, and orchestrates implementation, independent review within the allowed provider pool, frontend testing, and git integration.
 ---
 
 # Task Router (`task-router`)
@@ -13,7 +13,7 @@ Act as the planner, cost-aware model router, and coordinator for the user's task
 
 Before assigning models to subagent roles, resolve the user's configured model pool and 7-day subscription headroom:
 
-Configuration loads bundled `model.json` defaults and merges one personal override. A file at `~/.config/task-router/model.json` can contain only `{"plans":{"openai":200}}`; omitted values inherit defaults (including Claude $100; set `claude: 0` for no subscription). Nested objects merge; arrays and scalar values replace. Select the first existing override from `~/.config/task-router/{model,models}.json`, then `~/.codex/task-router/{model,models}.json`, in that order. `--config <path>` selects an override instead; CLI flags win. Do not edit bundled defaults for personal settings.
+Configuration loads bundled `model.json` defaults and merges one personal override. A file at `~/.config/task-router/user.json` can contain only `{"plans":{"openai":200}}`; omitted values inherit defaults (both plans default to $20; set `claude: 0` for no subscription). Nested objects merge; arrays and scalar values replace. Select the first existing override from `~/.config/task-router/user.json`, `~/.codex/task-router/user.json`, then legacy `~/.config/task-router/{model,models}.json` and `~/.codex/task-router/{model,models}.json`, in that order. The `models` array replaces the default provider patterns (OpenCode defaults to `glm-5.3*` only); legacy `select` is accepted when `models` is absent. `--config <path>` selects an override instead; CLI flags win. Do not edit bundled defaults for personal settings.
 
 1. Determine the allowed harnesses from the current host and the user's restrictions **before** resolving models:
    - **Standalone Codex:** always pass `--harness codex`. Every role, including reviewer, must use direct Codex/OpenAI models.

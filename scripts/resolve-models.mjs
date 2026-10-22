@@ -474,8 +474,8 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	const nowMs = Date.now();
 	const defaults = { latestGenerationOnly: true, preferDirectProvider: true, crossFamilyReview: true, respectRuntimeSettings: true, ...(config?.defaults || {}) };
 	const plans = {
-		codex: 200,
-		claudeAgent: 100,
+		codex: 20,
+		claudeAgent: 20,
 		...normalizePlans(config?.plans),
 		...normalizePlans(options.plans),
 	};
@@ -509,7 +509,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	}
 
 	const reasoningCfg = { coordinator: "medium", frontier: "high", workhorse: "medium", reviewer: "high", fast: "medium", ...(config?.reasoning || {}) };
-	const rulesByProvider = parseSelectRules(config?.select || []);
+	const rulesByProvider = parseSelectRules(config?.models ?? config?.select ?? []);
 	const enriched = catalogModels.map((m) => classifyModel(m));
 
 	const blockedApiSet = new Set((budgetCfg.blockApiSubproviders || []).map((s) => s.toLowerCase()));
@@ -809,6 +809,8 @@ export function loadConfig(customPath, homeDir = os.homedir(), skillRoot = SKILL
 		try {
 			const config = JSON.parse(fs.readFileSync(file, "utf8"));
 			if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("expected a JSON object");
+			if (!Object.hasOwn(config, "models") && Object.hasOwn(config, "select")) config.models = config.select;
+			delete config.select;
 			return config;
 		} catch (error) {
 			throw new Error(`Cannot load configuration ${file}: ${error.message}`);
@@ -818,6 +820,8 @@ export function loadConfig(customPath, homeDir = os.homedir(), skillRoot = SKILL
 	if (!bundledPath) throw new Error(`No bundled model.json or models.json found in ${skillRoot}`);
 	const defaults = readConfig(bundledPath);
 	const candidates = [
+		path.join(homeDir, ".config", "task-router", "user.json"),
+		path.join(homeDir, ".codex", "task-router", "user.json"),
 		path.join(homeDir, ".config", "task-router", "model.json"),
 		path.join(homeDir, ".config", "task-router", "models.json"),
 		path.join(homeDir, ".codex", "task-router", "model.json"),
