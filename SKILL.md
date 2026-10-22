@@ -13,6 +13,8 @@ Act as the planner, cost-aware model router, and coordinator for the user's task
 
 Before assigning models to subagent roles, resolve the user's configured model pool and 7-day subscription headroom:
 
+Configuration loads bundled `model.json` defaults and merges one personal override. A file at `~/.config/task-router/model.json` can contain only `{"plans":{"openai":200}}`; omitted values inherit defaults (including Claude $100; set `claude: 0` for no subscription). Nested objects merge; arrays and scalar values replace. Select the first existing override from `~/.config/task-router/{model,models}.json`, then `~/.codex/task-router/{model,models}.json`, in that order. `--config <path>` selects an override instead; CLI flags win. Do not edit bundled defaults for personal settings.
+
 1. Determine the allowed harnesses from the current host and the user's restrictions **before** resolving models:
    - **Standalone Codex:** always pass `--harness codex`. Every role, including reviewer, must use direct Codex/OpenAI models.
    - **Standalone Claude Code:** always pass `--harness claude`. Every role, including reviewer, must use direct Claude/Anthropic models.
@@ -28,6 +30,8 @@ Before assigning models to subagent roles, resolve the user's configured model p
    Treat the resulting pool as a hard boundary for all roles, substitutions, quota throttling, and budget modes. Cross-family review is a preference **within** that pool, never a reason to add DeepSeek or another excluded provider. With one family, use an independent same-family reviewer (prefer a different model when available). If the allowed pool is empty or cannot support a role, report the blocker; do not expand it automatically.
    Supported flags:
    - `--plan openai=200,claude=100` (or `openai=20,claude=100`) — set monthly subscription plan tiers (`$20`, `$100`, `$200`). Automatically maps each plan to its empirical weekly capacity (`$200` OpenAI Pro ≈ `$1750/wk eq`, `$20` OpenAI Plus ≈ `$175/wk eq`, `$200` Claude Max ≈ `$1500/wk eq`, `$100` Claude Max ≈ `$450/wk eq`, `$20` Claude Pro ≈ `$90/wk eq`), reads OpenAI's live server-reported `used_percent` from Codex session files, and **load-balances (`spreadAcrossSubscriptions: true`) toward whichever subscription has more remaining headroom**.
+   - `--config <path>` — merge the selected JSON override over bundled defaults; report missing or invalid files.
+   - `--throttle` — enforce quota-based throttling even when credits remain. Explicit custom caps also take precedence over credits.
    - `--report` — generate a full **Usage, Cost & Subscription ROI Report** across T3 (`usage-scan-cache-v5.json`) and OpenCode (`opencode.db`), including a Plan Simulator comparing `$200`, `$120 ($20+$100)`, `$40 ($20+$20)`, and pay-per-token Google API.
    - `--budget economy|balanced|performance` — override `budget.mode` (`economy` ranks cheapest $/M models first; `balanced` prioritizes subscriptions + workhorse coordinator; `performance` promotes `@frontier`).
    - `--weekly-limit codex=150,claude=250` (or `codex=300M`) — custom weekly cap override in API-equivalent USD or raw token count (`M`/`k`).
@@ -63,7 +67,7 @@ Present one recommended plan covering:
 - **Approach, design decisions, and affected components.**
 - **Implementation steps, dependencies, and distinct file ownership.**
 - **Cost-Optimized Model Routing Table** showing:
-  - Subscription status and active budget mode. A plan of `0` means **No subscription**; a configured but disabled provider means **Provider disabled**. Report valid weekly quota as **X% used / Y% remaining**, including observation time, window duration, reset time, and source. Missing or expired quota is **usage unknown**. Never present local API-equivalent estimates as provider-reported quota or infer zero usage from missing telemetry.
+  - Subscription status and active budget mode. A plan of `0` means **No subscription**; a configured but disabled provider means **Provider disabled**. Report valid weekly quota as **X% used / Y% remaining**, including observation time, window duration, reset time, and source. Report credits separately, preserving zero versus unknown, with the telemetry observation time and source. `hasCreditHeadroom: true` means valid current telemetry reports positive credits, `has_credits: true`, and no restriction: do not demote that provider for its included quota percentage; use normal model/cost ranking. Explicit custom caps and `--throttle` still apply. Credits are not a reset buffer or a subscription percentage. Missing or expired quota is **usage unknown**. Never present local API-equivalent estimates as provider-reported quota or infer zero usage from missing telemetry.
   - Each planned subagent role, its tier (`@fast`, `@workhorse`, `@frontier`, `@reviewer`), exact `providerInstanceId:model`, billing type (`subscription` vs `api`), reasoning level, and why that tier is sufficient.
 - **Validation, frontend testing, and potential complications.**
 

@@ -210,15 +210,16 @@ export function findLatestCodexRateLimits(homeDir = os.homedir(), fallbackFiles 
 					const resetsAtSec = window?.resets_at;
 					const valid = Number.isFinite(window?.used_percent) && window.used_percent >= 0 && window.used_percent <= 100
 						&& Number.isFinite(resetsAtSec) && resetsAtSec * 1000 > nowMs;
-					const rawBalance = Number(rl.credits?.balance ?? 0);
+					const balance = rl.credits?.balance;
+					const rawBalance = typeof balance === "number" || (typeof balance === "string" && balance.trim()) ? Number(balance) : NaN;
 					best = {
 						planType: rl.plan_type || null,
 						usedPercent: valid ? window.used_percent : null,
 						windowMinutes: window?.window_minutes ?? null,
 						resetsAtSec: Number.isFinite(resetsAtSec) ? resetsAtSec : null,
 						windowStartMs: valid ? (resetsAtSec - window.window_minutes * 60) * 1000 : null,
-						hasCredits: Boolean(rl.credits?.has_credits),
-						creditsBalance: Number.isFinite(rawBalance) ? rawBalance : 0,
+						hasCredits: rl.credits?.has_credits === true,
+						creditsBalance: Number.isFinite(rawBalance) && rawBalance >= 0 ? rawBalance : null,
 						rateLimitReached: Boolean(rl.rate_limit_reached_type || rl.spend_control_reached),
 						eventTsMs,
 						sourceFile: filePath,
@@ -470,6 +471,7 @@ export function normalizePlans(rawPlans = {}) {
 }
 
 export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHarnesses = null, runtimeState = null, options = {}) {
+	const nowMs = Date.now();
 	const defaults = { latestGenerationOnly: true, preferDirectProvider: true, crossFamilyReview: true, respectRuntimeSettings: true, ...(config?.defaults || {}) };
 	const plans = {
 		codex: 200,
@@ -490,9 +492,9 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		spreadAcrossSubscriptions: true,
 		blockApiSubproviders: ["openai", "anthropic"],
 		autoThrottle: options.autoThrottle ?? config?.budget?.autoThrottle ?? true,
-		weeklyLimitUsdEquivalent: { ...derivedWeeklyLimits, ...(config?.budget?.weeklyLimitUsdEquivalent || {}), ...(options.weeklyLimits || {}) },
 		autoDowngradeAbovePercent: config?.budget?.autoDowngradeAbovePercent ?? 80,
 		...(config?.budget || {}),
+		weeklyLimitUsdEquivalent: { ...derivedWeeklyLimits, ...(config?.budget?.weeklyLimitUsdEquivalent || {}) },
 	};
 	if (options.budgetMode) budgetCfg.mode = options.budgetMode;
 	if (options.autoThrottle !== undefined) budgetCfg.autoThrottle = options.autoThrottle;
@@ -533,7 +535,12 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const liveServerReported = !customLimit && Number.isFinite(liveLimit?.usedPercent);
 		const pct = liveServerReported ? liveLimit.usedPercent : customLimit ? estimatedPercentUsed : null;
 
-		const hasCreditHeadroom = Boolean(liveLimit?.hasCredits && liveLimit?.creditsBalance > 0 && !liveLimit?.rateLimitReached && !customLimit && !options.autoThrottle);
+		const creditsBalance = Number.isFinite(liveLimit?.creditsBalance) && liveLimit.creditsBalance >= 0 ? liveLimit.creditsBalance : null;
+		const currentCreditReading = liveServerReported && liveLimit.usedPercent >= 0 && liveLimit.usedPercent <= 100
+			&& liveLimit.windowMinutes === 10080 && liveLimit.resetsAtSec * 1000 > nowMs
+			&& Number.isFinite(liveLimit.eventTsMs) && liveLimit.eventTsMs <= nowMs
+			&& liveLimit.eventTsMs >= (liveLimit.resetsAtSec - 10080 * 60) * 1000;
+		const hasCreditHeadroom = Boolean(currentCreditReading && liveLimit.hasCredits === true && creditsBalance > 0 && !liveLimit.rateLimitReached && !customLimit && !options.autoThrottle);
 		const isOnlyActiveSub = enabledSubProviders.length === 1 && enabledSubProviders[0] === prov && !customLimit && !options.autoThrottle && !liveLimit?.rateLimitReached;
 		const overThreshold = pct !== null && pct >= budgetCfg.autoDowngradeAbovePercent;
 		const throttled = Boolean(budgetCfg.autoThrottle && overThreshold && !hasCreditHeadroom && !isOnlyActiveSub);
@@ -554,7 +561,8 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 			windowMinutes: liveLimit?.windowMinutes ?? null,
 			sourceFile: liveLimit?.sourceFile ?? null,
 			resetsAt: liveLimit?.resetsAtSec ? new Date(liveLimit.resetsAtSec * 1000).toISOString() : null,
-			creditsBalance: liveLimit?.creditsBalance || null,
+			creditsBalance,
+			hasCreditHeadroom,
 			overThreshold,
 			throttled,
 		};
@@ -608,7 +616,8 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		if (budgetCfg.preferSubscriptionOverApi && a.billing !== b.billing) {
 			return a.billing === "subscription" ? -1 : 1;
 		}
-		if (budgetCfg.spreadAcrossSubscriptions && a.billing === "subscription" && b.billing === "subscription" && a.providerInstanceId !== b.providerInstanceId) {
+		if (budgetCfg.spreadAcrossSubscriptions && a.billing === "subscription" && b.billing === "subscription" && a.providerInstanceId !== b.providerInstanceId
+			&& !quotaStatus[a.providerInstanceId]?.hasCreditHeadroom && !quotaStatus[b.providerInstanceId]?.hasCreditHeadroom) {
 			const aPct = quotaStatus[a.providerInstanceId]?.percentUsed;
 			const bPct = quotaStatus[b.providerInstanceId]?.percentUsed;
 			if (Number.isFinite(aPct) && Number.isFinite(bPct) && Math.abs(aPct - bPct) >= 10) return aPct - bPct;
@@ -678,7 +687,8 @@ function formatQuotaStatus(resolved) {
 		if (q.status === "disabled") return `\`${prov}\` ($${q.planMonthlyUsd}/mo configured): **Provider disabled**`;
 		const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
 		const label = q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} eq (${q.tokens7dM}M tok)`;
-		const creditNote = q.creditsBalance ? `, ${Math.round(q.creditsBalance).toLocaleString("en-US")} credits/reset buffer` : "";
+		const creditNote = prov === "codex" || q.creditsBalance != null
+			? `; credits: ${q.creditsBalance == null ? "unknown" : q.creditsBalance.toLocaleString("en-US", { maximumFractionDigits: 2 })}${q.hasCreditHeadroom ? " (available; quota-based demotion bypassed)" : " (no credit headroom applied)"}` : "";
 		const resetNote = q.resetsAt ? `, resets ${q.resetsAt}` : "";
 		const observedNote = q.observedAt ? `, observed ${q.observedAt}, window ${q.windowMinutes ?? "unknown"} minutes` : "";
 		const sourceNote = q.sourceFile ? `, source: \`${q.sourceFile}\`` : "";
@@ -788,20 +798,33 @@ export function formatUsageReport(runtimeState, resolved) {
 	return lines.join("\n");
 }
 
-function loadConfig(customPath) {
+function mergeConfig(base, override) {
+	const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+	if (!isObject(base) || !isObject(override)) return override;
+	return { ...base, ...Object.fromEntries(Object.entries(override).map(([key, value]) => [key, mergeConfig(base[key], value)])) };
+}
+
+export function loadConfig(customPath, homeDir = os.homedir(), skillRoot = SKILL_ROOT) {
+	const readConfig = (file) => {
+		try {
+			const config = JSON.parse(fs.readFileSync(file, "utf8"));
+			if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("expected a JSON object");
+			return config;
+		} catch (error) {
+			throw new Error(`Cannot load configuration ${file}: ${error.message}`);
+		}
+	};
+	const bundledPath = ["model.json", "models.json"].map((name) => path.join(skillRoot, name)).find((file) => fs.existsSync(file));
+	if (!bundledPath) throw new Error(`No bundled model.json or models.json found in ${skillRoot}`);
+	const defaults = readConfig(bundledPath);
 	const candidates = [
-		customPath,
-		path.join(os.homedir(), ".config", "task-router", "model.json"),
-		path.join(os.homedir(), ".config", "task-router", "models.json"),
-		path.join(os.homedir(), ".codex", "task-router", "model.json"),
-		path.join(os.homedir(), ".codex", "task-router", "models.json"),
-		path.join(SKILL_ROOT, "model.json"),
-		path.join(SKILL_ROOT, "models.json"),
-	].filter(Boolean);
-	for (const file of candidates) {
-		if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
-	}
-	throw new Error(`No model.json found in ${candidates.join(", ")}`);
+		path.join(homeDir, ".config", "task-router", "model.json"),
+		path.join(homeDir, ".config", "task-router", "models.json"),
+		path.join(homeDir, ".codex", "task-router", "model.json"),
+		path.join(homeDir, ".codex", "task-router", "models.json"),
+	];
+	const overridePath = customPath ?? candidates.find((file) => fs.existsSync(file));
+	return overridePath == null ? defaults : mergeConfig(defaults, readConfig(overridePath));
 }
 
 function parseLimitsArg(raw) {
@@ -832,6 +855,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const showReport = args.includes("--report");
 	const asJson = args.includes("--json");
 
+	if (configIdx !== -1 && (!args[configIdx + 1] || args[configIdx + 1].startsWith("--"))) throw new Error("--config requires a file path");
 	const config = loadConfig(configIdx !== -1 ? args[configIdx + 1] : null);
 	const runtimeState = staticOnly ? null : discoverRuntimeState();
 	const catalogModels = runtimeState ? runtimeState.catalog : CANONICAL_MODELS;

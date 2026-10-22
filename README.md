@@ -26,7 +26,7 @@ Invoke in your agent:
 
 Set a provider's plan to `0` (for example, `"claude": 0` or `--plan claude=0`) to declare **No subscription** and exclude its subscription models. A configured subscription with a disabled runtime provider is reported separately as **Provider disabled**.
 
-Quota output includes used/remaining percentages, observation time, weekly window duration, reset time, and source file. The resolver compares event timestamps across session and archive files; missing or expired weekly readings remain unknown. Estimated local costs do not drive subscription headroom balancing or throttling. Explicit custom caps still use local usage for throttling.
+Quota output includes used/remaining percentages, a separate credit balance, observation time, weekly window duration, reset time, and source file. Valid current Codex telemetry with `has_credits: true`, a positive balance, and no reported restriction bypasses quota-based throttling and percentage balancing. Normal model/cost ranking still applies. Explicit custom caps and `--throttle` take precedence. Missing credit balances show as unknown; a reported zero stays zero. Credits are not converted into a subscription percentage. The resolver compares event timestamps across session and archive files; missing or expired weekly readings remain unknown. Estimated local costs do not drive subscription headroom balancing or throttling. Explicit custom caps still use local usage for throttling.
 
 ## Setting Your Subscription Plans (`plans` & `--plan`)
 
@@ -53,8 +53,8 @@ node ~/.agents/skills/task-router/scripts/resolve-models.mjs --plan openai=20,cl
 | **Anthropic (`claude`)** | `200` (Max 20x $200/mo)<br>`100` (Max 5x $100/mo)<br>`20` (Pro $20/mo) | **~$1,500 / week eq**<br>**~$450 / week eq**<br>**~$90 / week eq** | Reports **usage unknown** without provider quota telemetry. Local token costs are API-equivalent estimates, not subscription usage. |
 
 When `"spreadAcrossSubscriptions": true` (default):
-- When both providers have reported quota readings, if `codex` is at `44% used` and `claudeAgent` is at `5% used`, the router **automatically promotes `claudeAgent` (`claude-sonnet-5-5`) as Primary Implementer/Coordinator** and assigns `codex` (`gpt-6.1-sol`) to Secondary Parallel Slices until both subscriptions balance out.
-- If either provider reaches `autoDowngradeAbovePercent` (default `80%`), it is marked `THROTTLED` and demoted behind your other subscription and cheap Cloudflare Workers AI models (`deepseek-v4-pro-0813`, `glm-5.3`).
+- When neither provider has usable credit headroom and both have reported quota readings, if `codex` is at `44% used` and `claudeAgent` is at `5% used`, the router **automatically promotes `claudeAgent` (`claude-sonnet-5-5`) as Primary Implementer/Coordinator** and assigns `codex` (`gpt-6.1-sol`) to Secondary Parallel Slices until both subscriptions balance out.
+- If a provider reaches `autoDowngradeAbovePercent` (default `80%`) without usable credit headroom, it can be marked `THROTTLED` and demoted behind your other subscription and cheap Cloudflare Workers AI models (`deepseek-v4-pro-0813`, `glm-5.3`).
 
 ---
 
@@ -86,7 +86,15 @@ Example output:
 
 ## Configuration Reference (`model.json`)
 
-By default, the skill reads `model.json` in the skill folder (`~/.agents/skills/task-router/model.json`). To keep personal overrides that survive `npx skills` updates, place a file at **`~/.config/task-router/model.json`** (which takes precedence automatically).
+The skill always loads bundled `model.json` as defaults, then merges one optional personal override. Keep only your changes in **`~/.config/task-router/model.json`**, outside the installed skill so updates preserve them:
+
+```json
+{"plans":{"openai":200}}
+```
+
+Omitted settings inherit the bundled defaults, including the Claude $100 plan. Set `"claude": 0` explicitly if you have no Claude subscription. Nested objects merge; arrays (including `select`) and scalar values replace the corresponding default. An empty array clears a default list.
+
+The first existing personal file wins, in this order: `~/.config/task-router/model.json`, `~/.config/task-router/models.json`, `~/.codex/task-router/model.json`, `~/.codex/task-router/models.json`. Lower-priority files are not merged. `--config /path/to/file.json` selects that override instead of autodiscovery; CLI flags apply last. Missing explicit files and invalid JSON produce an error that names the file. A legacy bundled `models.json` is supported when bundled `model.json` is absent.
 
 ### Full Default `model.json`
 
@@ -158,9 +166,9 @@ By default, the skill reads `model.json` in the skill folder (`~/.agents/skills/
 | `mode` | `"balanced" \| "economy" \| "performance"` | `"balanced"` | Controls how models are ranked inside each tier:<br>• `"balanced"` — Subscription `@workhorse` (`gpt-6.1-sol` / `claude-sonnet-5-5`) as Coordinator & primary implementer; `@fast` & open-weight models for recon/boilerplate.<br>• `"economy"` — Sorts every tier strictly by lowest $/M token cost (`deepseek-v4-pro-0813` and `glm-5.3` first for workhorse; `gpt-6-luna` / `glm-5.3-flash` first for fast; lowers workhorse reasoning to `low`/`medium`).<br>• `"performance"` — Promotes `@frontier` (`claude-opus-5-5`, `gpt-6-astra`) to the top of coordinator and review pools.<br>**Example:** `"mode": "economy"` |
 | `coordinatorTier` | `"workhorse" \| "frontier"` | `"workhorse"` | Selects the tier used for the main Coordinator session. Keeping this as `"workhorse"` (`gpt-6.1-sol` or `claude-sonnet-5-5`) saves **~8–10x cached-token burn** compared to running `gpt-6-astra` as Coordinator.<br>**Example:** `"coordinatorTier": "workhorse"` |
 | `preferSubscriptionOverApi` | `boolean` | `true` | In `"balanced"` mode, ranks flat-rate `subscription` providers (`codex`, `claudeAgent`) ahead of per-token `api` gateways (`opencode`) within the same tier.<br>**Example:** `"preferSubscriptionOverApi": true` |
-| `spreadAcrossSubscriptions` | `boolean` | `true` | Dynamically load-balances between `codex` and `claudeAgent` based on which subscription has lower 7-day % usage (when they differ by ≥10%).<br>**Example:** `"spreadAcrossSubscriptions": true` |
+| `spreadAcrossSubscriptions` | `boolean` | `true` | Dynamically load-balances between `codex` and `claudeAgent` based on which subscription has lower reported weekly % usage (when they differ by ≥10%). Percentage balancing is skipped when either provider has usable credit headroom.<br>**Example:** `"spreadAcrossSubscriptions": true` |
 | `blockApiSubproviders` | `string[]` | `["openai", "anthropic"]` | Prevents OpenCode from routing through paid per-token API keys for vendors you already cover via direct subscriptions (`openai/*`, `anthropic/*`).<br>**Example:** `"blockApiSubproviders": ["openai", "anthropic"]` |
-| `autoThrottle` | `boolean` | `true` | Automatically marks any provider whose 7-day rolling usage exceeds `autoDowngradeAbovePercent` as `THROTTLED` and shifts primary tasks to unthrottled subscriptions or cheap open-weight models.<br>**Example:** `"autoThrottle": true` |
+| `autoThrottle` | `boolean` | `true` | Demotes providers above `autoDowngradeAbovePercent` using reported weekly quota or an explicit custom cap. Available credit headroom bypasses quota demotion, except with explicit caps or `--throttle`.<br>**Example:** `"autoThrottle": true` |
 | `weeklyLimitUsdEquivalent` | `Record<string, number \| string>` | *(Derived from `plans`)* | Optional custom override for weekly rolling 7-day capacity per provider, either in API-equivalent USD (`250` or `"$250"`) or raw tokens (`"300M"`).<br>**Example:** `{"codex": "300M", "claudeAgent": "400M"}` |
 | `autoDowngradeAbovePercent` | `number` | `80` | Percentage of weekly capacity at which a provider is throttled.<br>**Example:** `"autoDowngradeAbovePercent": 80` |
 
@@ -194,7 +202,7 @@ Standalone Codex must use `--harness codex`; standalone Claude Code must use `--
 The CLI does not infer the host from environment variables (T3 can itself run Codex or Claude). Unscoped commands below are for hosts with cross-provider delegation; retain the appropriate `--harness` flag on every call in provider-only sessions.
 
 ```fish
-# Default (reads model.json + live T3 settings, OpenCode auth, and 7d usage telemetry)
+# Default (merges bundled defaults + one personal override; reads live settings and usage)
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs
 
 # Show full 7-day & all-time Usage, Cost & Plan Simulator Report
@@ -206,6 +214,9 @@ node ~/.agents/skills/task-router/scripts/resolve-models.mjs --plan openai=20,cl
 # Force Economy or Performance mode
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --budget economy
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --budget performance
+
+# Enforce quota throttling even when credits remain
+node ~/.agents/skills/task-router/scripts/resolve-models.mjs --throttle
 
 # Override weekly limits by USD-equivalent or raw token count (M / k)
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --weekly-limit codex=150,claude=250

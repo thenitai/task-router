@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { findLatestCodexRateLimits, scanUsageTelemetry, normalizePlans, formatMarkdown, formatUsageReport, planToWeeklyLimitUsd, resolveModels } from "../scripts/resolve-models.mjs";
+import { loadConfig, findLatestCodexRateLimits, scanUsageTelemetry, normalizePlans, formatMarkdown, formatUsageReport, planToWeeklyLimitUsd, resolveModels } from "../scripts/resolve-models.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultConfig = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "model.json"), "utf8"));
@@ -281,4 +281,138 @@ test("finds newest weekly event across older sessions and beyond the tail, witho
 	assert.equal(findLatestCodexRateLimits(home, [], now).usedPercent, null, "a newer event without weekly data must not revive an older reading");
 	fs.writeFileSync(source, event(now, -1));
 	assert.equal(findLatestCodexRateLimits(home, [], now).usedPercent, null);
+});
+
+test("credits bypass quota demotion, while explicit caps and throttle still win", () => {
+	const now = Date.now();
+	const reading = {
+		usedPercent: 95, windowMinutes: 10080, resetsAtSec: now / 1000 + 86400,
+		eventTsMs: now - 1000, sourceFile: "credit-fixture.jsonl",
+		hasCredits: true, creditsBalance: 40000, rateLimitReached: false,
+	};
+	const runtime = (patch = {}) => ({ usage: {
+		byProvider: { codex: { usd7d: 99, tokens7d: 400e6 } },
+		liveRateLimits: { codex: { ...reading, ...patch }, claudeAgent: { usedPercent: 5 } },
+	} });
+	for (const usedPercent of [95, 100]) {
+		const state = runtime({ usedPercent });
+		const resolved = resolveModels(defaultConfig, undefined, null, state);
+		assert.equal(resolved.quotaStatus.codex.hasCreditHeadroom, true);
+		assert.equal(resolved.quotaStatus.codex.percentRemaining, 100 - usedPercent);
+		assert.equal(resolved.quotaStatus.codex.throttled, false);
+		assert.equal(resolved.recommended.coordinator.providerInstanceId, "codex");
+		assert.equal(resolveModels(defaultConfig, undefined, null, state, { budgetMode: "performance" }).recommended.coordinator.providerInstanceId, "claudeAgent", "normal frontier cost ranking still favors Claude over Astra");
+		for (const report of [formatMarkdown(resolved), formatUsageReport(state, resolved)]) {
+			assert.ok(report.includes("credits: 40,000 (available; quota-based demotion bypassed)"));
+			assert.ok(report.includes(`${usedPercent}% used`));
+			assert.ok(report.includes(new Date(reading.eventTsMs).toISOString()));
+			assert.ok(report.includes(reading.sourceFile));
+			assert.ok(!report.includes("credits/reset buffer"));
+		}
+		const restricted = resolveModels(defaultConfig, undefined, ["codex"], state);
+		assert.ok(restricted.models.every((m) => m.providerInstanceId === "codex"));
+		assert.ok(Object.values(restricted.recommended).filter(Boolean).every((m) => m.providerInstanceId === "codex"));
+	}
+	for (const patch of [
+		{ creditsBalance: 0 }, { creditsBalance: null }, { creditsBalance: NaN }, { creditsBalance: -1 },
+		{ hasCredits: false }, { rateLimitReached: true }, { usedPercent: null },
+		{ resetsAtSec: now / 1000 - 1 }, { eventTsMs: now + 86400000 },
+		{ eventTsMs: now - 8 * 86400000 }, { eventTsMs: undefined },
+	]) {
+		assert.equal(resolveModels(defaultConfig, undefined, null, runtime(patch)).quotaStatus.codex.hasCreditHeadroom, false, JSON.stringify(patch));
+	}
+	const withoutCredits = resolveModels(defaultConfig, undefined, null, runtime({ creditsBalance: 0 }));
+	assert.equal(withoutCredits.quotaStatus.codex.throttled, true);
+	assert.equal(withoutCredits.quotaStatus.codex.creditsBalance, 0);
+	assert.equal(withoutCredits.recommended.coordinator.providerInstanceId, "claudeAgent");
+	assert.ok(formatMarkdown(withoutCredits).includes("credits: 0"));
+	assert.ok(formatMarkdown(resolveModels(defaultConfig)).includes("credits: unknown"));
+	for (const options of [{ autoThrottle: true }, { weeklyLimits: { codex: 100 } }, { weeklyLimits: { codex: "300M" } }]) {
+		const resolved = resolveModels(defaultConfig, undefined, null, runtime(), options);
+		assert.equal(resolved.quotaStatus.codex.hasCreditHeadroom, false);
+		assert.equal(resolved.quotaStatus.codex.throttled, true);
+	}
+	const cfg = { ...defaultConfig, budget: { ...defaultConfig.budget, weeklyLimitUsdEquivalent: { codex: 100 } } };
+	assert.equal(resolveModels(cfg, undefined, null, runtime()).quotaStatus.codex.throttled, true);
+	assert.equal(resolveModels(cfg).quotaStatus.claudeAgent.weeklyLimit, 450, "a custom cap retains other derived limits");
+});
+
+test("credit telemetry preserves zero versus unknown and never revives an older balance", (t) => {
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "router-credits-"));
+	t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+	const dir = path.join(home, ".codex", "sessions");
+	fs.mkdirSync(dir, { recursive: true });
+	const now = Date.now();
+	const event = (ts, balance, extra = {}) => JSON.stringify({ timestamp: new Date(ts).toISOString(), payload: { rate_limits: {
+		primary: { used_percent: 95, window_minutes: 10080, resets_at: now / 1000 + 86400 },
+		credits: { has_credits: true, balance }, ...extra,
+	} } });
+	const file = path.join(dir, "credits.jsonl");
+	for (const [balance, expected] of [["40000.25", 40000.25], [0, 0], ["0", 0], [undefined, null], [null, null], ["", null], ["bad", null], ["Infinity", null], [-1, null], [true, null]]) {
+		fs.writeFileSync(file, event(now - 2000, "50000") + "\n" + event(now - 1000, balance));
+		assert.equal(findLatestCodexRateLimits(home, [], now).creditsBalance, expected);
+	}
+	for (const extra of [
+		{ credits: null }, { spend_control_reached: true }, { rate_limit_reached_type: "weekly" },
+		{ primary: { used_percent: 100, window_minutes: 10080, resets_at: now / 1000 - 1 } },
+	]) {
+		fs.writeFileSync(file, event(now - 1000, "40000", extra));
+		const reading = findLatestCodexRateLimits(home, [], now);
+		const resolved = resolveModels(defaultConfig, undefined, null, { usage: { liveRateLimits: { codex: reading } } });
+		assert.equal(resolved.quotaStatus.codex.hasCreditHeadroom, false);
+	}
+});
+
+test("personal configuration merges defaults and respects path precedence", (t) => {
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "router-config-"));
+	t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+	const write = (relative, config) => {
+		const file = path.join(home, relative);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify(config));
+		return file;
+	};
+	assert.deepEqual(loadConfig(null, home), defaultConfig);
+	const candidates = [".config/task-router/model.json", ".config/task-router/models.json", ".codex/task-router/model.json", ".codex/task-router/models.json"];
+	for (const [index, candidate] of candidates.entries()) write(candidate, { plans: { openai: 20 + index }, reasoning: { fast: "low" } });
+	for (const [index, candidate] of candidates.entries()) {
+		const cfg = loadConfig(null, home);
+		assert.equal(cfg.plans.openai, 20 + index);
+		assert.equal(cfg.plans.claude, 100);
+		assert.deepEqual(cfg.select, defaultConfig.select);
+		assert.equal(cfg.reasoning.fast, "low");
+		assert.equal(cfg.reasoning.frontier, defaultConfig.reasoning.frontier);
+		assert.ok(resolveModels(cfg).models.length > 0);
+		fs.unlinkSync(path.join(home, candidate));
+	}
+	write(candidates[0], { plans: { openai: 500 }, select: [] });
+	const custom = write("custom.json", { plans: { openai: 20, claude: 0 }, budget: { mode: "economy", autoThrottle: false } });
+	const cfg = loadConfig(custom, home);
+	assert.equal(cfg.plans.openai, 20);
+	assert.equal(cfg.budget.mode, "economy");
+	assert.equal(cfg.budget.preferSubscriptionOverApi, true);
+	assert.equal(cfg.budget.autoThrottle, false);
+	assert.deepEqual(cfg.select, defaultConfig.select, "explicit config ignores discovered personal file");
+	assert.ok(resolveModels(cfg).models.every((m) => m.providerInstanceId !== "claudeAgent"));
+	const cli = JSON.parse(execFileSync(process.execPath, [path.join(__dirname, "..", "scripts", "resolve-models.mjs"), "--config", custom, "--static", "--json", "--budget", "performance", "--plan", "openai=200", "--weekly-limit", "codex=25", "--throttle"], { encoding: "utf8" }));
+	assert.equal(cli.plans.codex, 200);
+	assert.equal(cli.budget.mode, "performance");
+	assert.equal(cli.budget.autoThrottle, true);
+	assert.equal(cli.quotaStatus.codex.weeklyLimit, 25);
+	for (const args of [["--config"], ["--config", "--static"]]) {
+		assert.throws(() => execFileSync(process.execPath, [path.join(__dirname, "..", "scripts", "resolve-models.mjs"), ...args], { stdio: "pipe" }), /--config requires a file path/);
+	}
+	const arrays = write("arrays.json", { select: [], budget: { blockApiSubproviders: [] } });
+	assert.deepEqual(loadConfig(arrays, home).select, []);
+	assert.deepEqual(loadConfig(arrays, home).budget.blockApiSubproviders, []);
+	const nestedDefaults = write("bundle/models.json", { budget: { weeklyLimitUsdEquivalent: { codex: 50, claudeAgent: 100 } } });
+	const nested = write("nested.json", { budget: { weeklyLimitUsdEquivalent: { codex: 25 } } });
+	assert.deepEqual(loadConfig(nested, home, path.dirname(nestedDefaults)).budget.weeklyLimitUsdEquivalent, { codex: 25, claudeAgent: 100 });
+	assert.throws(() => loadConfig(path.join(home, "missing.json"), home), /Cannot load configuration .*missing.json/);
+	for (const content of ["{broken", "null", "[]", "42"]) {
+		fs.writeFileSync(custom, content);
+		assert.throws(() => loadConfig(custom, home), /Cannot load configuration .*custom.json/);
+	}
+	fs.writeFileSync(path.join(home, candidates[0]), "{broken");
+	assert.throws(() => loadConfig(null, home), /Cannot load configuration/);
 });
