@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { loadConfig, findLatestCodexRateLimits, scanUsageTelemetry, normalizePlans, formatMarkdown, formatUsageReport, planToWeeklyLimitUsd, resolveModels } from "../scripts/resolve-models.mjs";
+import { loadConfig, findLatestCodexRateLimits, scanUsageTelemetry, normalizePlans, formatMarkdown, formatUsageReport, planToWeeklyLimitUsd, resolveModels, matchesPattern } from "../scripts/resolve-models.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultConfig = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "model.json"), "utf8"));
@@ -31,8 +31,16 @@ test("default model.json resolves expected models and excludes claude-fable and 
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3"), "includes cloudflare-workers-ai glm-5.3");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash"), "includes cloudflare-workers-ai glm-5.3-flash");
 	assert.ok(!ids.includes("opencode/kimi-k3"), "excludes Kimi by default");
-	assert.ok(!ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813"), "excludes DeepSeek Pro by default");
-	assert.ok(!ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"), "excludes DeepSeek Flash by default");
+	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813"), "includes DeepSeek Pro by default");
+	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"), "includes DeepSeek Flash by default");
+});
+
+test("DeepSeek v4 wildcard includes minor versions and provider-prefixed IDs", () => {
+	for (const id of ["deepseek-v4-pro", "deepseek-v4.1-pro", "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4.1-flash"]) {
+		assert.ok(matchesPattern(id, "deepseek-v4*"), id);
+	}
+	assert.ok(!matchesPattern("deepseek-v3-pro", "deepseek-v4*"));
+	assert.ok(!matchesPattern("deepseek-v5-pro", "deepseek-v4*"));
 });
 
 test("recommends workhorse coordinator (not gpt-6-astra) in balanced mode and blocks OpenCode openai/anthropic API duplicates", () => {
@@ -77,7 +85,7 @@ test("throttles a provider when 7-day spend or token volume exceeds weekly limit
 	assert.equal(tokenResolved.quotaStatus.claudeAgent.throttled, false, "claudeAgent is not throttled at 15M / 300M tokens");
 
 	const economy = resolveModels(defaultConfig, undefined, null, null, { budgetMode: "economy" });
-	assert.equal(economy.recommended.primaryImplementer.id, "gpt-6.1-sol", "economy mode picks cheapest workhorse first");
+	assert.equal(economy.recommended.primaryImplementer.id, "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813", "economy mode picks cheapest workhorse first");
 });
 
 test("skips disabled T3 providers and respects hiddenModels + connected OpenCode gateways", () => {

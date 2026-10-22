@@ -129,7 +129,8 @@ The first existing personal file wins, in this order: `~/.config/task-router/use
     "claude:all",
     "claude:!fable",
 
-    "opencode:glm-5.3*"
+    "opencode:glm-5.3*",
+    "opencode:deepseek-v4*"
   ],
   "reasoning": {
     "coordinator": "medium",
@@ -186,7 +187,8 @@ The first existing personal file wins, in this order: `~/.config/task-router/use
     "codex:!luna",
     "claude:all",
     "claude:!fable",
-    "opencode:glm-5.3*"
+    "opencode:glm-5.3*",
+    "opencode:deepseek-v4*"
   ],
   "reasoning": {
     "coordinator": "medium",

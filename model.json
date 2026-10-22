@@ -24,7 +24,8 @@
     "claude:all",
     "claude:!fable",
 
-    "opencode:glm-5.3*"
+    "opencode:glm-5.3*",
+    "opencode:deepseek-v4*"
   ],
   "reasoning": {
     "coordinator": "medium",
