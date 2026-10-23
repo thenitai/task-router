@@ -188,3 +188,83 @@ test("OpenCode calendar-month spending isolates Cloudflare and flags missing cos
 	assert.equal(usage.apiSpending.cloudflare.spentUsd, 3);
 	assert.match(formatUsageReport({ usage }, resolveModels(config)), /unknown\/incomplete/);
 });
+
+test("plan overrides preserve explicit caps, while a CLI cap can replace them", () => {
+	const cfg = { ...config, budget: { ...config.budget, weeklyLimitUsdEquivalent: { codex: 10 } } };
+	const runtime = { usage: { byProvider: { codex: { usd7d: 20, tokens7d: 100 } } } };
+	const result = resolveModels(cfg, undefined, null, runtime, { plans: { openai: 100 } });
+	assert.equal(result.plans.codex, 100);
+	assert.equal(result.quotaStatus.codex.weeklyLimit, 10);
+	assert.equal(result.quotaStatus.codex.blocked, true);
+	const replaced = resolveModels(cfg, undefined, null, runtime, { plans: { openai: 100 }, weeklyLimits: { codex: 30 } });
+	assert.equal(replaced.quotaStatus.codex.weeklyLimit, 30);
+	assert.equal(replaced.quotaStatus.codex.blocked, false);
+	const alias = resolveModels({ ...cfg, budget: { ...cfg.budget, weeklyLimitUsdEquivalent: { openai: 10 } } }, undefined, null, runtime, { plans: { openai: 100 } });
+	assert.equal(alias.quotaStatus.codex.weeklyLimit, 10);
+	assert.equal(alias.quotaStatus.codex.blocked, true);
+	const aliasOverride = resolveModels(cfg, undefined, null, runtime, { weeklyLimits: { openai: 30 } });
+	assert.equal(aliasOverride.quotaStatus.codex.weeklyLimit, 30);
+	assert.equal(aliasOverride.quotaStatus.codex.blocked, false);
+});
+
+test("invalid CLI caps and plans fail instead of silently removing a restriction", () => {
+	const script = new URL("../scripts/resolve-models.mjs", import.meta.url).pathname;
+	const defaults = new URL("../model.json", import.meta.url).pathname;
+	for (const args of [
+		["--weekly-limit", "codex=garbage"], ["--weekly-limit", "codex=garbageM"],
+		["--weekly-limit", "codex=-1"], ["--weekly-limit", "codex=Infinity"],
+		["--weekly-limit", "codex=1G"], ["--weekly-limit", "codex=10,"],
+		["--weekly-limit", "unknown=10"], ["--weekly-limit"],
+		["--plan", "openai=garbage"], ["--plan", "openai=10M"], ["--plan"],
+	]) {
+		assert.throws(() => execFileSync(process.execPath, [script, "--config", defaults, "--static", "--json", ...args], { stdio: "pipe" }), (error) => error.status !== 0 && /requires|Invalid|unknown provider|monthly USD/.test(error.stderr.toString()), args.join(" "));
+	}
+	for (const limit of ["garbage", "garbageM", -1, Infinity, null]) {
+		assert.throws(() => resolveModels({ ...config, budget: { ...config.budget, weeklyLimitUsdEquivalent: { codex: limit } } }), /Invalid weekly limit/);
+	}
+	assert.throws(() => resolveModels({ ...config, budget: { ...config.budget, weeklyLimitUsdEquivalent: { typo: 10 } } }), /Invalid weekly limit provider/);
+	for (const caps of [10, false, [], null, "codex=10"]) {
+		assert.throws(() => resolveModels({ ...config, budget: { ...config.budget, weeklyLimitUsdEquivalent: caps } }), /Weekly limits must be an object/);
+		assert.throws(() => resolveModels(config, undefined, null, null, { weeklyLimits: caps }), /Weekly limits must be an object/);
+	}
+	const valid = JSON.parse(execFileSync(process.execPath, [script, "--config", defaults, "--static", "--json", "--weekly-limit", "codex=1.5M,claude=$12.50"], { encoding: "utf8" }));
+	assert.equal(valid.quotaStatus.codex.weeklyLimit, "1.5M");
+	assert.equal(valid.quotaStatus.claudeAgent.weeklyLimit, 12.5);
+});
+
+test("undated or invalid Cloudflare records make monthly spending incomplete", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const db = path.join(home, ".local", "share", "opencode", "opencode.db");
+	fs.mkdirSync(path.dirname(db), { recursive: true });
+	execFileSync("sqlite3", [db, "CREATE TABLE message (data TEXT);"]);
+	for (const created of [undefined, null, "bad", 0, -1, now + 60_000]) {
+		const message = { role: "assistant", providerID: "cloudflare-workers-ai", modelID: "@cf/zai-org/glm-5.3", time: { created }, cost: 50 };
+		execFileSync("sqlite3", [db, `DELETE FROM message; INSERT INTO message VALUES ('${JSON.stringify(message)}');`]);
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(usage.apiSpending.cloudflare.complete, false, String(created));
+		const result = resolveModels({ ...config, apiBudgets: { cloudflare: { monthlyUsd: 30 } } }, undefined, null, { usage });
+		assert.equal(result.apiBudgetStatus.cloudflare.blocked, true);
+		assert.equal(result.apiBudgetStatus.cloudflare.spentUsd, null);
+	}
+});
+
+test("large OpenCode histories return complete per-model spending without buffer overflow", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const db = path.join(home, ".local", "share", "opencode", "opencode.db");
+	fs.mkdirSync(path.dirname(db), { recursive: true });
+	execFileSync("sqlite3", [db, `CREATE TABLE message (data TEXT);
+		WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<15000)
+		INSERT INTO message SELECT json_object('role','assistant','providerID','cloudflare-workers-ai',
+		'modelID','@cf/deepseek-ai/deepseek-v4-flash-0731','time',json_object('created',${now - 1}),
+		'tokens',json_object('input',10000,'output',1000,'cache',json_object('read',50000)),'cost',0.001) FROM n;`]);
+	const usage = scanUsageTelemetry(home, now);
+	assert.deepEqual(usage.warnings, []);
+	assert.equal(usage.apiSpending.cloudflare.complete, true);
+	assert.ok(Math.abs(usage.apiSpending.cloudflare.spentUsd - 15) < 1e-6);
+	assert.equal(usage.byProvider.opencode.turns7d, 15000);
+	assert.equal(usage.byProvider.opencode.tokens7d, 15000 * 61000);
+	const result = resolveModels({ ...config, apiBudgets: { cloudflare: { monthlyUsd: 30 } } }, undefined, null, { usage });
+	assert.equal(result.apiBudgetStatus.cloudflare.blocked, false);
+});

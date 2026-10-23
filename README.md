@@ -28,7 +28,7 @@ OpenCode is the harness. Cloudflare Workers AI is metered API spending, independ
 
 - `apiBudgets.cloudflare.monthlyUsd: 0` blocks paid Cloudflare dispatch.
 - A positive amount sets a local UTC calendar-month dispatch budget, using Cloudflare-only costs recorded in this machine's OpenCode database.
-- Missing/incomplete spending blocks new Cloudflare dispatch under a configured budget. Missing costs are unknown, not zero. A recorded zero remains zero.
+- Missing/incomplete spending blocks new Cloudflare dispatch under a configured budget. Missing costs and undated/invalid Cloudflare records make spending incomplete. They are not treated as zero. A recorded zero remains zero.
 - Omitting the budget preserves existing routing behavior. It is not a provider billing cap: other machines, outside applications, missing records, and work already running can affect the final invoice.
 
 Nested objects merge with bundled defaults; arrays/scalars replace. `models` replaces the entire default pattern list; an empty list clears it. The first existing personal file wins:
@@ -40,7 +40,7 @@ Nested objects merge with bundled defaults; arrays/scalars replace. `models` rep
 5. `~/.codex/task-router/model.json`
 6. `~/.codex/task-router/models.json`
 
-`--config <path>` selects an explicit override; missing/invalid files fail with the path. CLI flags win. Legacy `select` is accepted when `models` is absent.
+`--config <path>` selects an explicit override; missing/invalid files fail with the path. CLI flags win. Explicit weekly caps remain in force when `--plan` changes; only `--weekly-limit` replaces those caps. Invalid cap values, units, providers, or missing arguments fail with an error. Legacy `select` is accepted when `models` is absent.
 
 ## Quota and failover
 
@@ -98,7 +98,7 @@ node ~/.agents/skills/task-router/scripts/resolve-models.mjs --static --json
 
 `budget.mode`: `balanced` (subscription workhorse first), `economy` (lowest API-equivalent model cost), or `performance` (frontier coordinator). `budget.spreadAcrossSubscriptions` balances valid reported weekly headroom when neither provider has usable credit headroom. `budget.autoThrottle` and `autoDowngradeAbovePercent` configure soft throttling. `budget.weeklyLimitUsdEquivalent` or `--weekly-limit` is an explicit local rolling-seven-day custom USD-equivalent/token cap, not provider quota. `--throttle` enforces quota demotion even with credits. `reasoning` controls coordinator/frontier/workhorse/reviewer/fast effort; supported reasoning is resolved per model.
 
-Reports separate subscription API-equivalent estimates from locally recorded API cash costs and provider-reported usage. T3 message dedupe keys, tail rows, and cache creation tokens are included. Missing cost shows unknown/incomplete. Token-price comparisons do not prove task quality, which sessions were coordinators, or how much subscription capacity a different plan includes.
+OpenCode totals are grouped inside SQLite, so accumulated message history does not overflow the command output buffer. Reports separate subscription API-equivalent estimates from locally recorded API cash costs and provider-reported usage. T3 message dedupe keys, tail rows, and cache creation tokens are included. Missing cost shows unknown/incomplete. Token-price comparisons do not prove task quality, which sessions were coordinators, or how much subscription capacity a different plan includes.
 
 ## Tests
 

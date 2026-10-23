@@ -337,63 +337,47 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 	const ocDbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
 	if (fs.existsSync(ocDbPath)) {
 		try {
-			const sql = `SELECT json_extract(data, '$.providerID') || '/' || json_extract(data, '$.modelID') AS model, json_extract(data, '$.time.created') AS ts, COALESCE(json_extract(data, '$.tokens.input'), 0) AS in_tok, COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS cache_read, COALESCE(json_extract(data, '$.tokens.output'), 0) AS out_tok, json_extract(data, '$.cost') AS cost FROM message WHERE json_extract(data, '$.role') = 'assistant';`;
-			const rawRows = execFileSync("sqlite3", ["-readonly", "-separator", "|", ocDbPath, sql], { encoding: "utf8", timeout: 3000 }).trim();
+			const periods = [["Total", "1"], ["30d", `ts >= ${thirtyDaysAgo}`], ["7d", `ts >= ${sevenDaysAgo}`]];
+			const sums = periods.flatMap(([suffix, condition]) => [
+				`SUM(CASE WHEN ${condition} AND known_cost THEN cost ELSE 0 END) AS usd${suffix}`,
+				`SUM(CASE WHEN ${condition} THEN input + cache_read + output ELSE 0 END) AS tokens${suffix}`,
+				`SUM(CASE WHEN ${condition} THEN 1 ELSE 0 END) AS turns${suffix}`,
+			]);
+			const sql = `WITH raw AS (
+				SELECT json_extract(data, '$.providerID') || '/' || json_extract(data, '$.modelID') AS model,
+				json_extract(data, '$.time.created') AS created, json_extract(data, '$.cost') AS cost,
+				COALESCE(json_extract(data, '$.tokens.input'), 0) AS input,
+				COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS cache_read,
+				COALESCE(json_extract(data, '$.tokens.output'), 0) AS output
+				FROM message WHERE json_extract(data, '$.role') = 'assistant'
+			), usage AS (
+				SELECT *, CASE WHEN typeof(created) IN ('integer', 'real') AND created > 0 AND created <= ${nowMs} THEN created END AS ts,
+				(typeof(cost) IN ('integer', 'real') AND cost >= 0) AS known_cost FROM raw
+			)
+			SELECT model, ${sums.join(", ")},
+				SUM(CASE WHEN ts >= ${sevenDaysAgo} THEN input ELSE 0 END) AS inTok7d,
+				SUM(CASE WHEN ts >= ${sevenDaysAgo} THEN cache_read ELSE 0 END) AS cacheRead7d,
+				SUM(CASE WHEN ts >= ${sevenDaysAgo} THEN output ELSE 0 END) AS outTok7d,
+				MAX(NOT known_cost) AS unknownCost,
+				MAX(ts IS NULL OR (ts >= ${sevenDaysAgo} AND NOT known_cost)) AS unknownCost7d,
+				SUM(CASE WHEN ts >= ${monthStartMs} AND known_cost THEN cost ELSE 0 END) AS monthUsd,
+				MAX(ts IS NULL OR (ts >= ${monthStartMs} AND NOT known_cost)) AS monthIncomplete
+			FROM usage WHERE model IS NOT NULL GROUP BY model;`;
+			// Return one row per model, so message history cannot overflow the child-process buffer.
+			const rawRows = execFileSync("sqlite3", ["-readonly", "-json", ocDbPath, sql], { encoding: "utf8", timeout: 3000 }).trim();
+			const rows = rawRows ? JSON.parse(rawRows) : [];
 			apiSpending.cloudflare = { monthStart: new Date(monthStartMs).toISOString(), spentUsd: 0, complete: true, sourceFile: ocDbPath };
-			if (rawRows) {
-				for (const line of rawRows.split("\n")) {
-					const [modelSlug, tsRaw, inRaw, cacheRaw, outRaw, costRaw] = line.split("|");
-					if (!modelSlug) continue;
-					const ts = Number(tsRaw) || 0;
-					if (ts > nowMs) continue;
-					const inTok = Number(inRaw) || 0;
-					const cacheRead = Number(cacheRaw) || 0;
-					const outTok = Number(outRaw) || 0;
-					const totalTokens = inTok + cacheRead + outTok;
-					const knownCost = costRaw !== "" && Number.isFinite(Number(costRaw)) && Number(costRaw) >= 0;
-					const recordedCost = knownCost ? Number(costRaw) : 0;
-					if (modelSlug.startsWith("cloudflare-workers-ai/") && ts >= monthStartMs) {
-						apiSpending.cloudflare.spentUsd += recordedCost;
-						if (!knownCost) apiSpending.cloudflare.complete = false;
-					}
-					const prov = "opencode";
-
-					if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokens30d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turns30d: 0, turnsTotal: 0 };
-					byProvider[prov].usdTotal += recordedCost;
-					byProvider[prov].tokensTotal += totalTokens;
-					byProvider[prov].turnsTotal += 1;
-					if (ts >= thirtyDaysAgo) {
-						byProvider[prov].usd30d += recordedCost;
-						byProvider[prov].tokens30d += totalTokens;
-						byProvider[prov].turns30d += 1;
-					}
-					if (ts >= sevenDaysAgo) {
-						byProvider[prov].usd7d += recordedCost;
-						byProvider[prov].tokens7d += totalTokens;
-						byProvider[prov].inTok7d += inTok;
-						byProvider[prov].cacheRead7d += cacheRead;
-						byProvider[prov].outTok7d += outTok;
-						byProvider[prov].turns7d += 1;
-					}
-
-					const mKey = `${prov}:${modelSlug}`;
-					if (!byModel[mKey]) byModel[mKey] = { provider: prov, model: modelSlug, billing: "api", usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turnsTotal: 0 };
-					if (!knownCost) {
-						byModel[mKey].unknownCost = true;
-						if (ts >= sevenDaysAgo) byModel[mKey].unknownCost7d = true;
-					}
-					byModel[mKey].usdTotal += recordedCost;
-					byModel[mKey].tokensTotal += totalTokens;
-					byModel[mKey].turnsTotal += 1;
-					if (ts >= thirtyDaysAgo) byModel[mKey].usd30d += recordedCost;
-					if (ts >= sevenDaysAgo) {
-						byModel[mKey].usd7d += recordedCost;
-						byModel[mKey].tokens7d += totalTokens;
-						byModel[mKey].inTok7d += inTok;
-						byModel[mKey].cacheRead7d += cacheRead;
-						byModel[mKey].outTok7d += outTok;
-						byModel[mKey].turns7d += 1;
-					}
+			for (const { model, monthUsd, monthIncomplete, ...totals } of rows) {
+				const prov = "opencode";
+				byModel[`${prov}:${model}`] = { provider: prov, model, billing: "api", ...totals };
+				byProvider[prov] ??= {};
+				for (const [key, value] of Object.entries(totals)) {
+					if (key.startsWith("unknown")) continue;
+					byProvider[prov][key] = (byProvider[prov][key] || 0) + value;
+				}
+				if (model.startsWith("cloudflare-workers-ai/")) {
+					apiSpending.cloudflare.spentUsd += monthUsd;
+					if (monthIncomplete) apiSpending.cloudflare.complete = false;
 				}
 			}
 		} catch { warnings.push("OpenCode spending unavailable: cannot read local database"); }
@@ -513,6 +497,31 @@ function dispatchOptions(model, reasoning, speed) {
 	return { variant: reasoning };
 }
 
+function weeklyLimitValue(raw, provider) {
+	if (!["codex", "claudeAgent", "opencode"].includes(provider)) throw new Error("Invalid weekly limit provider: use codex, claudeAgent, or opencode");
+	if (typeof raw === "number") {
+		if (Number.isFinite(raw) && raw >= 0) return raw;
+		throw new Error(`Invalid weekly limit for ${provider}: value must be finite and non-negative`);
+	}
+	const text = typeof raw === "string" ? raw.trim() : "";
+	const tokenLimit = /^(?:\d+(?:\.\d*)?|\.\d+)[mk]$/i.test(text);
+	if (!tokenLimit && !/^\$?(?:\d+(?:\.\d*)?|\.\d+)$/.test(text)) {
+		throw new Error(`Invalid weekly limit for ${provider}: use non-negative USD or tokens ending in k/M`);
+	}
+	const value = tokenLimit ? Number(text.slice(0, -1)) * (text.toLowerCase().endsWith("m") ? 1e6 : 1e3) : Number(text.replace(/^\$/, ""));
+	if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid weekly limit for ${provider}: value must be finite and non-negative`);
+	return value;
+}
+
+function normalizeWeeklyLimits(limits = {}) {
+	if (limits === null || typeof limits !== "object" || Array.isArray(limits)) throw new Error("Weekly limits must be an object mapping providers to caps");
+	return Object.fromEntries(Object.entries(limits).map(([provider, value]) => {
+		const normalized = normalizeProvider(provider);
+		weeklyLimitValue(value, normalized);
+		return [normalized, value];
+	}));
+}
+
 export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHarnesses = null, runtimeState = null, options = {}) {
 	const nowMs = Date.now();
 	const defaults = { latestGenerationOnly: true, preferDirectProvider: true, crossFamilyReview: true, respectRuntimeSettings: true, ...(config?.defaults || {}) };
@@ -527,27 +536,23 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	for (const [prov, planUsd] of Object.entries(plans)) {
 		derivedWeeklyLimits[prov] = planToWeeklyLimitUsd(prov, planUsd);
 	}
+	const configLimits = normalizeWeeklyLimits(config?.budget?.weeklyLimitUsdEquivalent);
+	const optionLimits = normalizeWeeklyLimits(options.weeklyLimits);
 
 	const budgetCfg = {
 		mode: options.budgetMode || config?.budget?.mode || "balanced",
-		coordinatorTier: config?.budget?.coordinatorTier || "workhorse",
 		preferSubscriptionOverApi: true,
 		spreadAcrossSubscriptions: true,
 		blockApiSubproviders: ["openai", "anthropic"],
 		autoThrottle: options.autoThrottle ?? config?.budget?.autoThrottle ?? true,
 		autoDowngradeAbovePercent: config?.budget?.autoDowngradeAbovePercent ?? 80,
 		...(config?.budget || {}),
-		weeklyLimitUsdEquivalent: { ...derivedWeeklyLimits, ...(config?.budget?.weeklyLimitUsdEquivalent || {}) },
+		weeklyLimitUsdEquivalent: { ...derivedWeeklyLimits, ...configLimits },
 	};
 	if (options.budgetMode) budgetCfg.mode = options.budgetMode;
 	if (options.autoThrottle !== undefined) budgetCfg.autoThrottle = options.autoThrottle;
-	if (options.plans) {
-		for (const [prov, planUsd] of Object.entries(normalizePlans(options.plans))) {
-			budgetCfg.weeklyLimitUsdEquivalent[prov] = planToWeeklyLimitUsd(prov, planUsd);
-		}
-	}
 	if (options.weeklyLimits) {
-		budgetCfg.weeklyLimitUsdEquivalent = { ...budgetCfg.weeklyLimitUsdEquivalent, ...options.weeklyLimits };
+		budgetCfg.weeklyLimitUsdEquivalent = { ...budgetCfg.weeklyLimitUsdEquivalent, ...optionLimits };
 		budgetCfg.autoThrottle = true;
 	}
 
@@ -565,17 +570,17 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	const subProviders = Object.keys(budgetCfg.weeklyLimitUsdEquivalent || {});
 	const enabledSubProviders = subProviders.filter((p) => plans[p] > 0 && !runtimeState?.disabledProviders?.has(p) && (!activeHarnesses || activeHarnesses.includes(p)));
 	for (const [prov, rawLimit] of Object.entries(budgetCfg.weeklyLimitUsdEquivalent || {})) {
+		const limitVal = weeklyLimitValue(rawLimit, prov);
 		if (plans[prov] === 0 || runtimeState?.disabledProviders?.has(prov)) {
 			quotaStatus[prov] = { planMonthlyUsd: plans[prov], status: plans[prov] === 0 ? "no-subscription" : "disabled", percentUsed: null, percentRemaining: null, throttled: false };
 			continue;
 		}
 		const isTokenLimit = typeof rawLimit === "string" && /[mk]$/i.test(rawLimit.trim());
 		const liveLimit = runtimeState?.usage?.liveRateLimits?.[prov];
-		const customLimit = options.weeklyLimits?.[prov] !== undefined || config?.budget?.weeklyLimitUsdEquivalent?.[prov] !== undefined;
+		const customLimit = optionLimits[prov] !== undefined || configLimits[prov] !== undefined;
 		const useWindowStats = Boolean(!isTokenLimit && liveLimit?.windowStartMs && runtimeState?.usage?.byProvider?.[prov]?.usdWindow !== undefined && !customLimit);
 		const spent7d = useWindowStats ? runtimeState.usage.byProvider[prov].usdWindow : (runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0);
 		const tokens7d = useWindowStats ? runtimeState.usage.byProvider[prov].tokensWindow : (runtimeState?.usage?.byProvider?.[prov]?.tokens7d ?? 0);
-		const limitVal = isTokenLimit ? (rawLimit.toLowerCase().endsWith("m") ? parseFloat(rawLimit) * 1e6 : parseFloat(rawLimit) * 1e3) : Number(String(rawLimit).replace(/^\$/, ""));
 		const currentVal = isTokenLimit ? tokens7d : spent7d;
 		const estimatedPercentUsed = runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
 		const liveServerReported = !customLimit && Number.isFinite(liveLimit?.usedPercent);
@@ -912,18 +917,20 @@ export function loadConfig(customPath, homeDir = os.homedir(), skillRoot = SKILL
 	return overridePath == null ? defaults : mergeConfig(defaults, readConfig(overridePath));
 }
 
-function parseLimitsArg(raw) {
+function parseLimitsArg(raw, flag) {
+	if (typeof raw !== "string" || !raw.trim() || raw.startsWith("--")) throw new Error(`${flag} requires provider=value`);
 	const out = {};
-	for (const part of String(raw || "").split(",")) {
-		const [k, v] = part.split("=");
-		if (!k || !v) continue;
+	for (const part of raw.split(",")) {
+		const match = /^([^=]+)=([^=]+)$/.exec(part);
+		if (!match) throw new Error(`${flag} requires provider=value for every entry`);
+		const [, k, v] = match;
+		const provider = normalizeProvider(k.trim());
+		if (!["codex", "claudeAgent", ...(flag === "--weekly-limit" ? ["opencode"] : [])].includes(provider)) throw new Error(`${flag}: unknown provider`);
 		const clean = v.trim();
-		if (/[mk]$/i.test(clean)) {
-			out[normalizeProvider(k.trim())] = clean.toUpperCase();
-		} else {
-			const num = Number(clean.replace(/^\$/, ""));
-			if (!Number.isNaN(num)) out[normalizeProvider(k.trim())] = num;
-		}
+		const value = weeklyLimitValue(clean, provider);
+		const tokens = /[mk]$/i.test(clean);
+		if (flag === "--plan" && tokens) throw new Error("--plan accepts monthly USD, not token counts");
+		out[provider] = tokens ? clean.toUpperCase() : value;
 	}
 	return out;
 }
@@ -944,7 +951,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
 	if (configIdx !== -1 && (!args[configIdx + 1] || args[configIdx + 1].startsWith("--"))) throw new Error("--config requires a file path");
 	const config = loadConfig(configIdx !== -1 ? args[configIdx + 1] : null);
-	const planOverrides = planIdx !== -1 ? parseLimitsArg(args[planIdx + 1]) : undefined;
+	const planOverrides = planIdx !== -1 ? parseLimitsArg(args[planIdx + 1], "--plan") : undefined;
+	const weeklyOverrides = limitIdx !== -1 ? parseLimitsArg(args[limitIdx + 1], "--weekly-limit") : undefined;
 	const effectivePlans = { codex: 20, claudeAgent: 20, ...normalizePlans(config.plans), ...normalizePlans(planOverrides) };
 	const activeHarnesses = harnessIdx !== -1 ? args[harnessIdx + 1].split(",").map((h) => normalizeProvider(h.trim())) : null;
 	if (blockIdx !== -1) {
@@ -968,7 +976,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const options = {
 		budgetMode: budgetIdx !== -1 ? args[budgetIdx + 1] : undefined,
 		plans: planOverrides,
-		weeklyLimits: limitIdx !== -1 ? parseLimitsArg(args[limitIdx + 1]) : undefined,
+		weeklyLimits: weeklyOverrides,
 		autoThrottle,
 	};
 
