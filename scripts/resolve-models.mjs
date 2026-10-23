@@ -143,6 +143,7 @@ export function classifyModel(model) {
 			billing,
 			cost: model.cost || known.cost,
 			reasoningOptions: model.reasoningOptions?.length ? model.reasoningOptions : known.reasoningOptions,
+			...(model.liveOptions && { liveOptions: model.liveOptions }),
 		};
 	}
 	const lower = String(model.id).toLowerCase();
@@ -159,6 +160,7 @@ export function classifyModel(model) {
 		tiers,
 		generation: isLegacy ? "legacy" : "current",
 		reasoningOptions: model.reasoningOptions || ["low", "medium", "high"],
+		...(model.liveOptions && { liveOptions: model.liveOptions }),
 		notes: "",
 	};
 }
@@ -370,16 +372,20 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 			// Return one row per model, so message history cannot overflow the child-process buffer.
 			const rawRows = execFileSync("sqlite3", ["-readonly", "-json", ocDbPath, sql], { encoding: "utf8", timeout: 3000 }).trim();
 			const rows = rawRows ? JSON.parse(rawRows) : [];
+			byProvider.opencode ??= { usd7d: 0, tokens7d: 0, unknownCost7d: 0 };
 			apiSpending.cloudflare = { monthStart: new Date(monthStartMs).toISOString(), spentUsd: 0, complete: true, sourceFile: ocDbPath };
 			for (const { model, monthUsd, monthIncomplete, ...totals } of rows) {
 				const prov = "opencode";
 				byModel[`${prov}:${model}`] = { provider: prov, model, billing: "api", ...totals };
 				byProvider[prov] ??= {};
 				for (const [key, value] of Object.entries(totals)) {
-					if (key.startsWith("unknown")) continue;
+					if (key.startsWith("unknown")) {
+						byProvider[prov][key] = Math.max(byProvider[prov][key] || 0, value);
+						continue;
+					}
 					byProvider[prov][key] = (byProvider[prov][key] || 0) + value;
 				}
-				if (model.startsWith("unknown/")) apiSpending.cloudflare.complete = false;
+				if (model.startsWith("unknown/") && (monthIncomplete || monthUsd > 0)) apiSpending.cloudflare.complete = false;
 				if (model.startsWith("cloudflare-workers-ai/")) {
 					apiSpending.cloudflare.spentUsd += monthUsd;
 					if (monthIncomplete) apiSpending.cloudflare.complete = false;
@@ -432,16 +438,25 @@ export function discoverRuntimeState(homeDir = os.homedir()) {
 	}
 
 	const catalog = [];
+	let codexCacheRead = false;
 	const codexCachePath = path.join(homeDir, ".codex", "models_cache.json");
 	if (fs.existsSync(codexCachePath)) {
 		try {
 			const codexCache = JSON.parse(fs.readFileSync(codexCachePath, "utf8"));
-			for (const m of codexCache.models || []) {
+			if (!Array.isArray(codexCache.models)) throw new Error("Invalid Codex model cache");
+			const cachedModels = [];
+			for (const m of codexCache.models) {
+				if (typeof m?.slug !== "string" || !m.slug.trim()) throw new Error("Invalid Codex model ID");
 				if (m.visibility && m.visibility !== "list") continue;
 				const reasoningOptions = (m.supported_reasoning_levels || []).map((r) => r.effort).filter(Boolean);
-				catalog.push({ providerInstanceId: "codex", id: m.slug, label: m.display_name || m.slug, billing: "subscription", reasoningOptions });
+				cachedModels.push({ providerInstanceId: "codex", id: m.slug, label: m.display_name || m.slug, billing: "subscription", reasoningOptions });
 			}
+			catalog.push(...cachedModels);
+			codexCacheRead = true;
 		} catch {}
+	}
+	if (!codexCacheRead) {
+		catalog.push(...CANONICAL_MODELS.filter((m) => m.providerInstanceId === "codex"));
 	}
 
 	for (const cModel of CANONICAL_MODELS.filter((m) => m.providerInstanceId === "claudeAgent")) {
@@ -482,7 +497,7 @@ export function discoverRuntimeState(homeDir = os.homedir()) {
 		modelOrder,
 		connectedOpencodeSubproviders,
 		usage,
-		catalog: catalog.length > 0 ? catalog : CANONICAL_MODELS,
+		catalog,
 	};
 }
 
@@ -499,7 +514,7 @@ export function catalogFromCapabilities(capabilities) {
 				&& (!Array.isArray(reasoningOptions) || reasoningOptions.length === 0 || reasoningOptions.some((value) => typeof value !== "string" || !value.trim()))) {
 				throw new Error(`Catalog mismatch: ${provider.providerInstanceId}:${model.id} must advertise ${optionId} values`);
 			}
-			return { ...model, providerInstanceId: provider.providerInstanceId, reasoningOptions: reasoningOptions || [] };
+			return { ...model, providerInstanceId: provider.providerInstanceId, reasoningOptions: reasoningOptions || [], liveOptions: model.options };
 		});
 	});
 }
@@ -515,9 +530,17 @@ export function normalizePlans(rawPlans = {}) {
 }
 
 function dispatchOptions(model, reasoning, speed) {
-	if (model.providerInstanceId === "codex") return { reasoningEffort: reasoning, serviceTier: speed === "fast" ? "priority" : "default" };
-	if (model.providerInstanceId === "claudeAgent") return { effort: reasoning, ...(model.id.includes("opus") ? { fastMode: speed === "fast" } : {}) };
-	return { variant: reasoning };
+	const options = model.providerInstanceId === "codex" ? { reasoningEffort: reasoning, serviceTier: speed === "fast" ? "priority" : "default" }
+		: model.providerInstanceId === "claudeAgent" ? { effort: reasoning, ...(model.id.includes("opus") ? { fastMode: speed === "fast" } : {}) }
+		: { variant: reasoning };
+	if (model.liveOptions) {
+		for (const [id, value] of Object.entries(options)) {
+			if (!model.liveOptions.find((option) => option.id === id)?.values?.includes(value)) {
+				throw new Error(`Catalog mismatch: ${model.providerInstanceId}:${model.id} does not support ${id}=${value}`);
+			}
+		}
+	}
+	return options;
 }
 
 function weeklyLimitValue(raw, provider) {
@@ -605,7 +628,9 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const spent7d = useWindowStats ? runtimeState.usage.byProvider[prov].usdWindow : (runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0);
 		const tokens7d = useWindowStats ? runtimeState.usage.byProvider[prov].tokensWindow : (runtimeState?.usage?.byProvider?.[prov]?.tokens7d ?? 0);
 		const currentVal = isTokenLimit ? tokens7d : spent7d;
-		const estimatedPercentUsed = runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
+		const spendingIncomplete = customLimit && !isTokenLimit && (!Number.isFinite(runtimeState?.usage?.byProvider?.[prov]?.usd7d)
+			|| spent7d < 0 || Boolean(runtimeState?.usage?.byProvider?.[prov]?.unknownCost7d));
+		const estimatedPercentUsed = !spendingIncomplete && runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
 		const liveServerReported = !customLimit && Number.isFinite(liveLimit?.usedPercent);
 		const pct = liveServerReported ? liveLimit.usedPercent : customLimit ? estimatedPercentUsed : null;
 
@@ -618,7 +643,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const reportedBlock = liveLimit?.rateLimitReached && (liveLimit.rateLimitResetsAtSec == null || liveLimit.rateLimitResetsAtSec * 1000 > nowMs);
 		const hasCreditHeadroom = Boolean(currentCreditReading && liveLimit.hasCredits === true && creditsBalance > 0 && !reportedBlock && !customLimit && !options.autoThrottle);
 		const exhausted = windows.some((w) => w.usedPercent >= 100) || (liveServerReported && liveLimit.usedPercent >= 100);
-		const blocked = blockedProviders.has(prov) || Boolean(reportedBlock) || (exhausted && !hasCreditHeadroom) || (customLimit && limitVal >= 0 && currentVal >= limitVal);
+		const blocked = spendingIncomplete || blockedProviders.has(prov) || Boolean(reportedBlock) || (exhausted && !hasCreditHeadroom) || (customLimit && limitVal >= 0 && currentVal >= limitVal);
 		if (blocked) blockedProviders.add(prov);
 		const isOnlyActiveSub = enabledSubProviders.length === 1 && enabledSubProviders[0] === prov && !customLimit && !options.autoThrottle && !reportedBlock;
 		const overThreshold = pct !== null && pct >= budgetCfg.autoDowngradeAbovePercent;
@@ -628,7 +653,8 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 			planMonthlyUsd: plans[prov] ?? null,
 			status: "active",
 			unit: isTokenLimit ? "tokens" : "usd",
-			spent7dUsd: Number(spent7d.toFixed(2)),
+			spent7dUsd: spendingIncomplete ? null : Number(spent7d.toFixed(2)),
+			spendingIncomplete,
 			tokens7dM: Number((tokens7d / 1e6).toFixed(1)),
 			weeklyLimit: rawLimit,
 			percentUsed: pct,
@@ -742,6 +768,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 				reasoning: pickReasoning(desiredEffort, model.reasoningOptions),
 				options: dispatchOptions(model, pickReasoning(desiredEffort, model.reasoningOptions), speed),
 				reasoningOptions: model.reasoningOptions,
+				...(model.liveOptions && { liveOptions: model.liveOptions }),
 				notes: model.notes,
 			});
 		}
@@ -795,7 +822,7 @@ function formatQuotaStatus(resolved) {
 		if (q.status === "no-subscription") return `\`${prov}\`: **No subscription**`;
 		if (q.status === "disabled") return `\`${prov}\` ($${q.planMonthlyUsd}/mo configured): **Provider disabled**`;
 		const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
-		const label = q.customLimit
+		const label = q.spendingIncomplete ? "spending unknown/incomplete" : q.customLimit
 			? q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} custom eq cap (${q.tokens7dM}M tok)`
 			: `$${q.spent7dUsd} eq (${q.tokens7dM}M tok)`;
 		const creditNote = prov === "codex" || q.creditsBalance != null

@@ -331,3 +331,95 @@ test("live T3 catalog replaces stale cached IDs and keeps advertised reasoning a
 	assert.deepEqual(resolved.models.map((m) => m.id), [id]);
 	assert.throws(() => execFileSync(process.execPath, [script, "--catalog"], { stdio: "pipe" }), /Command failed/);
 });
+
+test("weekly dollar caps block incomplete costs but preserve known zero and token caps", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const db = path.join(home, ".local", "share", "opencode", "opencode.db");
+	fs.mkdirSync(path.dirname(db), { recursive: true });
+	execFileSync("sqlite3", [db, "CREATE TABLE message (data TEXT);"]);
+	const cfg = { ...config, budget: { ...config.budget, weeklyLimitUsdEquivalent: { opencode: 10 } } };
+	const resolve = (usage, options) => resolveModels(cfg, undefined, ["opencode"], { usage }, options);
+	assert.equal(resolve(null).quotaStatus.opencode.blocked, true);
+	const empty = scanUsageTelemetry(home, now);
+	assert.equal(resolve(empty).quotaStatus.opencode.blocked, false);
+	const message = { role: "assistant", providerID: "cloudflare-workers-ai", modelID: "@cf/zai-org/glm-5.3", time: { created: now - 1 }, tokens: { input: 10 } };
+	execFileSync("sqlite3", [db, `INSERT INTO message VALUES ('${JSON.stringify(message)}');`]);
+	let usage = scanUsageTelemetry(home, now);
+	let result = resolve(usage);
+	assert.equal(usage.byProvider.opencode.unknownCost7d, 1);
+	assert.equal(result.quotaStatus.opencode.blocked, true);
+	assert.equal(result.quotaStatus.opencode.spent7dUsd, null);
+	assert.equal(result.quotaStatus.opencode.percentUsed, null);
+	assert.deepEqual(result.models, []);
+	assert.match(formatUsageReport({ usage }, result), /spending unknown\/incomplete/);
+	assert.equal(resolve(usage, { weeklyLimits: { opencode: "1M" } }).quotaStatus.opencode.blocked, false);
+	for (const cost of [0, 3, 10]) {
+		execFileSync("sqlite3", [db, `UPDATE message SET data=json_set(data, '$.cost', ${cost});`]);
+		usage = scanUsageTelemetry(home, now);
+		result = resolve(usage);
+		assert.equal(result.quotaStatus.opencode.spent7dUsd, cost);
+		assert.equal(result.quotaStatus.opencode.blocked, cost >= 10);
+	}
+});
+
+test("standalone discovery falls back for missing or invalid Codex caches but respects an empty valid cache", async (t) => {
+	const { discoverRuntimeState } = await import("../scripts/resolve-models.mjs");
+	const home = tempHome(t);
+	const cache = path.join(home, ".codex", "models_cache.json");
+	const resolve = () => {
+		const runtime = discoverRuntimeState(home);
+		return resolveModels(config, runtime.catalog, ["codex"], runtime);
+	};
+	assert.equal(resolve().recommended.coordinator.id, "gpt-6.1-sol");
+	writeJson(cache, {});
+	assert.equal(resolve().recommended.crossFamilyReviewer.id, "gpt-6-astra");
+	fs.writeFileSync(cache, "{broken");
+	assert.ok(resolve().models.length > 0);
+	for (const model of [{}, { slug: "" }, { slug: "  " }, { slug: 30 }, null]) {
+		writeJson(cache, { models: [{ slug: "cache-partial-model" }, model] });
+		const result = resolve();
+		assert.equal(result.recommended.coordinator.id, "gpt-6.1-sol");
+		assert.ok(!result.models.some((m) => m.id === "cache-partial-model"));
+	}
+	writeJson(cache, { models: [] });
+	assert.deepEqual(resolve().models, []);
+	writeJson(cache, { models: [{ slug: "gpt-6-luna", visibility: "list", supported_reasoning_levels: [{ effort: "low" }] }] });
+	assert.deepEqual(resolve().models.map((m) => m.id), ["gpt-6-luna"]);
+	writeJson(path.join(home, ".t3", "userdata", "settings.json"), { providerInstances: { codex: { enabled: false } } });
+	fs.unlinkSync(cache);
+	assert.deepEqual(resolve().models, []);
+});
+
+test("unknown provider attribution only blocks months its charge could affect", (t) => {
+	const home = tempHome(t);
+	const now = Date.UTC(2026, 9, 23);
+	const db = path.join(home, ".local", "share", "opencode", "opencode.db");
+	fs.mkdirSync(path.dirname(db), { recursive: true });
+	execFileSync("sqlite3", [db, "CREATE TABLE message (data TEXT);"]);
+	for (const [created, cost, blocked] of [[Date.UTC(2026, 8, 15), 50, false], [Date.UTC(2026, 9, 1), 50, true], [now - 1, 0, false], [undefined, 50, true], [now - 1, undefined, true]]) {
+		const message = { role: "assistant", modelID: "unknown-provider-model", cost, time: { created } };
+		execFileSync("sqlite3", [db, `DELETE FROM message; INSERT INTO message VALUES ('${JSON.stringify(message)}');`]);
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(resolveModels({ ...config, apiBudgets: { cloudflare: { monthlyUsd: 30 } } }, undefined, null, { usage }).apiBudgetStatus.cloudflare.blocked, blocked, JSON.stringify(message));
+	}
+});
+
+test("live dispatch validates speed options for every recommended role", async () => {
+	const { catalogFromCapabilities } = await import("../scripts/resolve-models.mjs");
+	for (const [providerInstanceId, id, effortId, speedId, standard, fast] of [
+		["codex", "gpt-6.1-sol", "reasoningEffort", "serviceTier", "default", "priority"],
+		["claudeAgent", "claude-opus-5-5", "effort", "fastMode", false, true],
+	]) {
+		const options = [{ id: effortId, values: ["low", "medium", "high"] }, { id: speedId, values: [standard] }];
+		const resolve = (speed) => resolveModels({ ...config, speed }, catalogFromCapabilities({ providers: [{ providerInstanceId, canRunChildTask: true, models: [{ id, options }] }] }));
+		let result = resolve("standard");
+		assert.ok(Object.values(result.recommended).filter(Boolean).every((m) => m.options[speedId] === standard));
+		assert.throws(() => resolve("fast"), /Catalog mismatch/);
+		options[1].values.push(fast);
+		result = resolve("fast");
+		assert.ok(Object.values(result.recommended).filter(Boolean).every((m) => m.options[speedId] === fast));
+		options.pop();
+		assert.throws(() => resolve("standard"), /Catalog mismatch/);
+	}
+});
