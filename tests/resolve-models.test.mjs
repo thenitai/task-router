@@ -171,8 +171,11 @@ test("CLI provider-only restrictions cover every role across budget modes and th
 				usage: { liveRateLimits: { [provider]: { usedPercent: 100, rateLimitReached: true } } },
 			}, { budgetMode: budget });
 			assert.equal(throttled.quotaStatus[provider].throttled, true);
+			assert.equal(throttled.quotaStatus[provider].blocked, true);
+			assert.equal(throttled.models.length, 0, "an exhausted single-provider pool stays empty");
+			assert.ok(Object.values(throttled.recommended).every((model) => model === null));
 			for (const result of [resolved, throttled]) {
-				assert.ok(result.recommended.crossFamilyReviewer, `${harness}/${budget} has a reviewer`);
+				if (result === resolved) assert.ok(result.recommended.crossFamilyReviewer, `${harness}/${budget} has a reviewer`);
 				for (const model of [...result.models, ...Object.values(result.tiers).flat(), ...Object.values(result.recommended).filter(Boolean)]) {
 					assert.equal(model.providerInstanceId, provider, `${harness}/${budget}: ${model.id}`);
 					assert.equal(model.family, family);
@@ -224,7 +227,8 @@ test("maps monthly plans (openai=200, claude=100) to weekly capacity and load-ba
 	assert.equal(resolved.recommended.secondaryImplementer.providerInstanceId, "codex", "keeps codex as secondary parallel implementer");
 
 	const report = formatUsageReport(runtimeState, resolved);
-	assert.ok(report.includes("Subscription Plan Simulator"));
+	assert.ok(report.includes("not subscription quota"));
+	assert.ok(report.includes("openai=100, claude=100"));
 	assert.ok(report.includes("openai=20, claude=100"));
 });
 
