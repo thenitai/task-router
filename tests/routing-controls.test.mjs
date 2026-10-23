@@ -268,3 +268,66 @@ test("large OpenCode histories return complete per-model spending without buffer
 	const result = resolveModels({ ...config, apiBudgets: { cloudflare: { monthlyUsd: 30 } } }, undefined, null, { usage });
 	assert.equal(result.apiBudgetStatus.cloudflare.blocked, false);
 });
+
+test("Cloudflare charges survive missing model metadata", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const db = path.join(home, ".local", "share", "opencode", "opencode.db");
+	fs.mkdirSync(path.dirname(db), { recursive: true });
+	execFileSync("sqlite3", [db, "CREATE TABLE message (data TEXT);"]);
+	for (const modelID of [undefined, null, "", "   "]) {
+		const message = { role: "assistant", providerID: "cloudflare-workers-ai", modelID, time: { created: now - 1 }, cost: 50 };
+		execFileSync("sqlite3", [db, `DELETE FROM message; INSERT INTO message VALUES ('${JSON.stringify(message)}');`]);
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(usage.apiSpending.cloudflare.spentUsd, 50);
+		assert.equal(usage.apiSpending.cloudflare.complete, true);
+		assert.equal(resolveModels({ ...config, apiBudgets: { cloudflare: { monthlyUsd: 30 } } }, undefined, null, { usage }).apiBudgetStatus.cloudflare.blocked, true);
+	}
+	for (const providerID of [undefined, null, "", "   ", "\t", "\n", false, 30, {}, []]) {
+		const message = { role: "assistant", providerID, time: { created: now - 1 }, cost: 50 };
+		execFileSync("sqlite3", [db, `DELETE FROM message; INSERT INTO message VALUES ('${JSON.stringify(message)}');`]);
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(usage.apiSpending.cloudflare.complete, false, JSON.stringify(providerID));
+		assert.equal(resolveModels({ ...config, apiBudgets: { cloudflare: { monthlyUsd: 30 } } }, undefined, null, { usage }).apiBudgetStatus.cloudflare.blocked, true);
+	}
+});
+
+test("malformed API budget maps cannot silently remove spending restrictions", () => {
+	for (const apiBudgets of [null, 30, false, [], { cloudlfare: { monthlyUsd: 30 } },
+		{ cloudflare: null }, { cloudflare: [] }, { cloudflare: 30 }, { cloudflare: {} },
+		{ cloudflare: { monthlyUSD: 30 } }, { cloudflare: { monthlyUsd: "30" } },
+		{ cloudflare: { monthlyUsd: NaN } }, { cloudflare: { monthlyUsd: Infinity } }]) {
+		assert.throws(() => resolveModels({ ...config, apiBudgets }), /apiBudgets/);
+	}
+	assert.deepEqual(resolveModels(config).apiBudgetStatus, {});
+	assert.deepEqual(resolveModels({ ...config, apiBudgets: {} }).apiBudgetStatus, {});
+});
+
+test("live T3 catalog replaces stale cached IDs and keeps advertised reasoning and harness limits", async (t) => {
+	const { catalogFromCapabilities } = await import("../scripts/resolve-models.mjs");
+	const id = "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4.1-flash-1017";
+	const capabilities = { providers: [
+		{ providerInstanceId: "opencode", canRunChildTask: true, models: [{ id, options: [{ id: "variant", values: ["none", "low", "high", "max"] }] }] },
+		{ providerInstanceId: "codex", canRunChildTask: false, models: [{ id: "gpt-6.1-sol" }] },
+	] };
+	const catalog = catalogFromCapabilities(capabilities);
+	assert.equal(catalog.length, 1);
+	for (const options of [undefined, [], [{ id: "reasoningEffort", values: [] }], [{ id: "reasoningEffort", values: [true] }]]) {
+		assert.throws(() => catalogFromCapabilities({ providers: [{ providerInstanceId: "codex", canRunChildTask: true, models: [{ id: "gpt-6.1-sol", options }] }] }), /Catalog mismatch/);
+	}
+	const result = resolveModels(config, catalog);
+	assert.deepEqual(result.models.map((m) => m.id), [id]);
+	assert.equal(result.recommended.fastRecon.options.variant, "high");
+	assert.deepEqual(resolveModels(config, catalog, ["codex"]).models, []);
+	assert.throws(() => catalogFromCapabilities({}), /Catalog/);
+	assert.throws(() => catalogFromCapabilities({ providers: [{}] }), /catalog provider/);
+	assert.throws(() => catalogFromCapabilities({ providers: [{ ...capabilities.providers[0], models: [{ id: null }] }] }), /model ID/);
+	const home = tempHome(t);
+	const file = path.join(home, "catalog.json");
+	writeJson(file, capabilities);
+	const script = new URL("../scripts/resolve-models.mjs", import.meta.url).pathname;
+	const defaults = new URL("../model.json", import.meta.url).pathname;
+	const resolved = JSON.parse(execFileSync(process.execPath, [script, "--static", "--config", defaults, "--catalog", file, "--json"], { encoding: "utf8" }));
+	assert.deepEqual(resolved.models.map((m) => m.id), [id]);
+	assert.throws(() => execFileSync(process.execPath, [script, "--catalog"], { stdio: "pipe" }), /Command failed/);
+});

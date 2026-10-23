@@ -344,7 +344,11 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 				`SUM(CASE WHEN ${condition} THEN 1 ELSE 0 END) AS turns${suffix}`,
 			]);
 			const sql = `WITH raw AS (
-				SELECT json_extract(data, '$.providerID') || '/' || json_extract(data, '$.modelID') AS model,
+				SELECT CASE WHEN json_type(data, '$.providerID') = 'text'
+					AND TRIM(json_extract(data, '$.providerID')) != ''
+					AND TRIM(json_extract(data, '$.providerID')) NOT GLOB '*[^a-zA-Z0-9_-]*'
+					THEN TRIM(json_extract(data, '$.providerID')) ELSE 'unknown' END || '/' ||
+				COALESCE(NULLIF(TRIM(json_extract(data, '$.modelID')), ''), 'unknown') AS model,
 				json_extract(data, '$.time.created') AS created, json_extract(data, '$.cost') AS cost,
 				COALESCE(json_extract(data, '$.tokens.input'), 0) AS input,
 				COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS cache_read,
@@ -375,6 +379,7 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 					if (key.startsWith("unknown")) continue;
 					byProvider[prov][key] = (byProvider[prov][key] || 0) + value;
 				}
+				if (model.startsWith("unknown/")) apiSpending.cloudflare.complete = false;
 				if (model.startsWith("cloudflare-workers-ai/")) {
 					apiSpending.cloudflare.spentUsd += monthUsd;
 					if (monthIncomplete) apiSpending.cloudflare.complete = false;
@@ -479,6 +484,24 @@ export function discoverRuntimeState(homeDir = os.homedir()) {
 		usage,
 		catalog: catalog.length > 0 ? catalog : CANONICAL_MODELS,
 	};
+}
+
+export function catalogFromCapabilities(capabilities) {
+	if (!Array.isArray(capabilities?.providers)) throw new Error("Catalog must contain the providers array from orchestrator_capabilities");
+	return capabilities.providers.flatMap((provider) => {
+		if (typeof provider.providerInstanceId !== "string" || !Array.isArray(provider.models)) throw new Error("Invalid catalog provider");
+		if (provider.canRunChildTask !== true) return [];
+		return provider.models.map((model) => {
+			if (typeof model.id !== "string" || !model.id.trim()) throw new Error("Invalid catalog model ID");
+			const optionId = provider.providerInstanceId === "codex" ? "reasoningEffort" : provider.providerInstanceId === "claudeAgent" ? "effort" : "variant";
+			const reasoningOptions = model.options?.find((option) => option.id === optionId)?.values;
+			if (["codex", "claudeAgent", "opencode"].includes(provider.providerInstanceId)
+				&& (!Array.isArray(reasoningOptions) || reasoningOptions.length === 0 || reasoningOptions.some((value) => typeof value !== "string" || !value.trim()))) {
+				throw new Error(`Catalog mismatch: ${provider.providerInstanceId}:${model.id} must advertise ${optionId} values`);
+			}
+			return { ...model, providerInstanceId: provider.providerInstanceId, reasoningOptions: reasoningOptions || [] };
+		});
+	});
 }
 
 export function normalizePlans(rawPlans = {}) {
@@ -627,7 +650,14 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		};
 	}
 	const apiBudgetStatus = {};
+	if (config?.apiBudgets !== undefined) {
+		const budgets = config.apiBudgets;
+		if (budgets === null || typeof budgets !== "object" || Array.isArray(budgets)) throw new Error("apiBudgets must be an object mapping providers to budgets");
+		if (Object.keys(budgets).some((key) => key !== "cloudflare")) throw new Error("Unknown apiBudgets provider: only cloudflare is supported");
+	}
 	if (config?.apiBudgets?.cloudflare !== undefined) {
+		const budget = config.apiBudgets.cloudflare;
+		if (budget === null || typeof budget !== "object" || Array.isArray(budget) || Object.keys(budget).some((key) => key !== "monthlyUsd")) throw new Error("apiBudgets.cloudflare must be an object containing monthlyUsd");
 		const monthlyUsd = config.apiBudgets.cloudflare.monthlyUsd;
 		if (typeof monthlyUsd !== "number" || !Number.isFinite(monthlyUsd) || monthlyUsd < 0) throw new Error("apiBudgets.cloudflare.monthlyUsd must be a non-negative number");
 		const spending = runtimeState?.usage?.apiSpending?.cloudflare;
@@ -938,6 +968,7 @@ function parseLimitsArg(raw, flag) {
 if (import.meta.url === `file://${process.argv[1]}`) {
 	const args = process.argv.slice(2);
 	const configIdx = args.indexOf("--config");
+	const catalogIdx = args.indexOf("--catalog");
 	const harnessIdx = args.indexOf("--harness");
 	const budgetIdx = args.indexOf("--budget");
 	const planIdx = args.indexOf("--plan");
@@ -950,6 +981,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const asJson = args.includes("--json");
 
 	if (configIdx !== -1 && (!args[configIdx + 1] || args[configIdx + 1].startsWith("--"))) throw new Error("--config requires a file path");
+	if (catalogIdx !== -1 && (!args[catalogIdx + 1] || args[catalogIdx + 1].startsWith("--"))) throw new Error("--catalog requires a file path");
+	const liveCatalog = catalogIdx === -1 ? null : catalogFromCapabilities(JSON.parse(fs.readFileSync(args[catalogIdx + 1], "utf8")));
 	const config = loadConfig(configIdx !== -1 ? args[configIdx + 1] : null);
 	const planOverrides = planIdx !== -1 ? parseLimitsArg(args[planIdx + 1], "--plan") : undefined;
 	const weeklyOverrides = limitIdx !== -1 ? parseLimitsArg(args[limitIdx + 1], "--weekly-limit") : undefined;
@@ -972,7 +1005,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 		runtimeState.usage ??= { byProvider: {}, byModel: {}, liveRateLimits: {} };
 		runtimeState.usage.liveRateLimits.claudeAgent = await readClaudeQuota();
 	}
-	const catalogModels = runtimeState ? runtimeState.catalog : CANONICAL_MODELS;
+	const catalogModels = liveCatalog ?? (runtimeState ? runtimeState.catalog : CANONICAL_MODELS);
 	const options = {
 		budgetMode: budgetIdx !== -1 ? args[budgetIdx + 1] : undefined,
 		plans: planOverrides,

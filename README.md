@@ -69,6 +69,8 @@ Rerun the resolver, prefer an eligible alternative subscription, then allowed AP
 | Claude Sonnet/Haiku | No separate speed toggle | No separate speed toggle | `effort` |
 | OpenCode | Model default | Model default | `variant` |
 
+In T3, call `orchestrator_capabilities` before resolving and save its structured JSON result (the object containing `providers`) to a temporary file. Pass `--catalog <file>` on every resolver call, alongside the original harness restriction. This live snapshot replaces cached model IDs and supplies advertised reasoning options; disabled/non-delegatable providers are excluded. Missing or empty reasoning descriptors for supported harnesses report a catalog mismatch instead of reviving cached options. The tool returns a shortened catalog: use its `search` argument for missing configured models and merge those results by provider/model ID before saving. Refresh the snapshot before dispatch or failover; never add IDs from favorites alone. Standalone clients omit `--catalog` and keep local cache discovery.
+
 In T3, verify live `orchestrator_capabilities`, pass options in `delegate_task.target.options`, and check the returned provider/model/options. Unsupported options must be reported, not silently substituted. Explicit options prevent inherited premium-speed settings from accidentally carrying into a standard-speed task. Use a subscription workhorse such as Sol/Sonnet as coordinator; reserve Astra/Opus for bounded difficult slices and independent review. Keep expensive frontier agents out of repetitive exploration/tool loops.
 
 The model list defaults to direct Codex/Claude plus OpenCode GLM 5.3 and DeepSeek V4 patterns; Fable/legacy models are excluded. Direct subscriptions rank before paid gateways, and OpenCode `openai/*` / `anthropic/*` are blocked to avoid accidental duplicate API billing. Disabled providers, hidden models, and unavailable gateways are respected. Cross-family review is a preference within the permitted pool.
@@ -78,8 +80,8 @@ The model list defaults to direct Codex/Claude plus OpenCode GLM 5.3 and DeepSee
 Standalone Codex must pass `--harness codex`; standalone Claude must pass `--harness claude`. T3 supports cross-provider routing unless the user restricts it. Never infer the host solely from the coordinator model.
 
 ```sh
-# T3 cross-provider defaults + personal settings + current telemetry
-node ~/.agents/skills/task-router/scripts/resolve-models.mjs
+# T3: save orchestrator_capabilities structured result to /tmp/task-router-catalog.json first
+node ~/.agents/skills/task-router/scripts/resolve-models.mjs --catalog /tmp/task-router-catalog.json
 
 # Usage report: current supported T3 cache (v9 through v5) and OpenCode
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --report
