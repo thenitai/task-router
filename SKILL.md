@@ -87,9 +87,17 @@ Remain the coordinator. Assign every role only from the restricted resolved pool
 - Give every agent a **self-contained brief** with:
   1. Enumerated requirements and settled decisions.
   2. Constraints from `AGENTS.md`.
-  3. Absolute worktree path and expected branch.
+  3. Absolute path of its own worktree and the coordinator commit it starts from.
   4. Bounded file ownership, acceptance criteria, and validation duties.
 - Explicitly set model and reasoning levels on every call. Report unavailable configurations before substituting.
+
+### Subagent Worktrees
+
+Every subagent that edits files gets its own worktree, so no agent can overwrite another agent's or the coordinator's changes. Read-only roles (exploration, review) may read the coordinator's worktree instead.
+1. **Create from the coordinator's branch:** commit the coordinator's pending work first (uncommitted edits are not copied), then run `git worktree add --detach <repo-worktrees>/<task>-<role> HEAD` from the coordinator's worktree. Prefer native worktree isolation (`isolation: "worktree"` on the Agent tool or `delegate_task`) only when it starts from the coordinator's local HEAD; otherwise create the worktree yourself and pass its path. Never point two agents at one worktree.
+2. **Work there:** the subagent edits and commits only inside its worktree and never pushes, rebases the coordinator, or touches other worktrees.
+3. **Merge back:** after it finishes, verify its worktree is clean, then from the coordinator's worktree run `git merge --no-edit <subagent HEAD sha>` (fast-forward when possible). Merge one subagent at a time; resolve conflicts in the coordinator's worktree and rerun affected checks. Do not merge failed or unreviewed work.
+4. **Remove:** once `git merge-base --is-ancestor <subagent sha> HEAD` succeeds, run non-forced `git worktree remove <path>` and confirm it is gone from `git worktree list`. If it holds uncommitted or unmerged work, keep it and report why. Never use `--force` or `rm -rf`.
 
 ---
 
