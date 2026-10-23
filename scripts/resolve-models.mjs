@@ -219,8 +219,10 @@ export function findLatestCodexRateLimits(homeDir = os.homedir(), fallbackFiles 
 					const balance = rl.credits?.balance;
 					const rawBalance = typeof balance === "number" || (typeof balance === "string" && balance.trim()) ? Number(balance) : NaN;
 					const rejectionType = String(rl.rate_limit_reached_type || "").toLowerCase();
-					const rejectedWindows = /primary|five|5h|short/.test(rejectionType) ? [rl.primary]
-						: /secondary|seven|7d|week/.test(rejectionType) ? [rl.secondary]
+					const rejectedWindows = /primary/.test(rejectionType) ? [rl.primary]
+						: /secondary/.test(rejectionType) ? [rl.secondary]
+						: /five|5h|short/.test(rejectionType) ? [rl.primary, rl.secondary].filter((w) => w?.window_minutes === 300)
+						: /seven|7d|week/.test(rejectionType) ? [rl.primary, rl.secondary].filter((w) => w?.window_minutes === 10080)
 						: [rl.primary, rl.secondary].filter((w) => w?.used_percent >= 100);
 					const rejectionResets = rl.spend_control_reached ? [] : rejectedWindows.map((w) => w?.resets_at).filter(Number.isFinite);
 					best = {
@@ -630,7 +632,8 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const currentVal = isTokenLimit ? tokens7d : spent7d;
 		const spendingIncomplete = customLimit && !isTokenLimit && (!Number.isFinite(runtimeState?.usage?.byProvider?.[prov]?.usd7d)
 			|| spent7d < 0 || Boolean(runtimeState?.usage?.byProvider?.[prov]?.unknownCost7d));
-		const estimatedPercentUsed = !spendingIncomplete && runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
+		const tokensIncomplete = customLimit && isTokenLimit && (!Number.isFinite(runtimeState?.usage?.byProvider?.[prov]?.tokens7d) || tokens7d < 0);
+		const estimatedPercentUsed = !spendingIncomplete && !tokensIncomplete && runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
 		const liveServerReported = !customLimit && Number.isFinite(liveLimit?.usedPercent);
 		const pct = liveServerReported ? liveLimit.usedPercent : customLimit ? estimatedPercentUsed : null;
 
@@ -643,7 +646,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const reportedBlock = liveLimit?.rateLimitReached && (liveLimit.rateLimitResetsAtSec == null || liveLimit.rateLimitResetsAtSec * 1000 > nowMs);
 		const hasCreditHeadroom = Boolean(currentCreditReading && liveLimit.hasCredits === true && creditsBalance > 0 && !reportedBlock && !customLimit && !options.autoThrottle);
 		const exhausted = windows.some((w) => w.usedPercent >= 100) || (liveServerReported && liveLimit.usedPercent >= 100);
-		const blocked = spendingIncomplete || blockedProviders.has(prov) || Boolean(reportedBlock) || (exhausted && !hasCreditHeadroom) || (customLimit && limitVal >= 0 && currentVal >= limitVal);
+		const blocked = spendingIncomplete || tokensIncomplete || blockedProviders.has(prov) || Boolean(reportedBlock) || (exhausted && !hasCreditHeadroom) || (customLimit && limitVal >= 0 && currentVal >= limitVal);
 		if (blocked) blockedProviders.add(prov);
 		const isOnlyActiveSub = enabledSubProviders.length === 1 && enabledSubProviders[0] === prov && !customLimit && !options.autoThrottle && !reportedBlock;
 		const overThreshold = pct !== null && pct >= budgetCfg.autoDowngradeAbovePercent;
@@ -655,7 +658,8 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 			unit: isTokenLimit ? "tokens" : "usd",
 			spent7dUsd: spendingIncomplete ? null : Number(spent7d.toFixed(2)),
 			spendingIncomplete,
-			tokens7dM: Number((tokens7d / 1e6).toFixed(1)),
+			tokens7dM: tokensIncomplete ? null : Number((tokens7d / 1e6).toFixed(1)),
+			tokensIncomplete,
 			weeklyLimit: rawLimit,
 			percentUsed: pct,
 			percentRemaining: pct === null ? null : Math.max(0, 100 - pct),
@@ -822,7 +826,7 @@ function formatQuotaStatus(resolved) {
 		if (q.status === "no-subscription") return `\`${prov}\`: **No subscription**`;
 		if (q.status === "disabled") return `\`${prov}\` ($${q.planMonthlyUsd}/mo configured): **Provider disabled**`;
 		const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
-		const label = q.spendingIncomplete ? "spending unknown/incomplete" : q.customLimit
+		const label = q.tokensIncomplete ? "token usage unknown/incomplete" : q.spendingIncomplete ? "spending unknown/incomplete" : q.customLimit
 			? q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} custom eq cap (${q.tokens7dM}M tok)`
 			: `$${q.spent7dUsd} eq (${q.tokens7dM}M tok)`;
 		const creditNote = prov === "codex" || q.creditsBalance != null

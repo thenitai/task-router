@@ -423,3 +423,60 @@ test("live dispatch validates speed options for every recommended role", async (
 		assert.throws(() => resolve("standard"), /Catalog mismatch/);
 	}
 });
+
+test("semantic Codex rejection labels follow window duration regardless of position", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const file = path.join(home, ".codex", "sessions", "swapped.jsonl");
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const weekly = { used_percent: 100, window_minutes: 10080, resets_at: now / 1000 + 86400 };
+	const short = { used_percent: 10, window_minutes: 300, resets_at: now / 1000 - 1 };
+	const read = (type, primary, secondary) => {
+		fs.writeFileSync(file, JSON.stringify({ timestamp: new Date(now - 1000).toISOString(), payload: { rate_limits: {
+			rate_limit_reached_type: type, primary, secondary, credits: { has_credits: true, balance: 10 },
+		} } }));
+		return findLatestCodexRateLimits(home, [], now);
+	};
+	for (const type of ["weekly", "seven_day", "7d"]) {
+		for (const [primary, secondary] of [[weekly, short], [short, weekly]]) {
+			const limit = read(type, primary, secondary);
+			assert.equal(limit.rateLimitResetsAtSec, weekly.resets_at);
+			const result = resolveModels(config, undefined, ["codex"], { usage: { liveRateLimits: { codex: limit } } });
+			assert.equal(result.quotaStatus.codex.hasCreditHeadroom, false);
+			assert.equal(result.quotaStatus.codex.blocked, true);
+			assert.deepEqual(result.models, []);
+		}
+	}
+	for (const type of ["five_hour", "5h", "short"]) {
+		const limit = read(type, weekly, short);
+		assert.equal(limit.rateLimitResetsAtSec, short.resets_at);
+		const result = resolveModels(config, undefined, ["codex"], { usage: { liveRateLimits: { codex: limit } } });
+		assert.equal(result.quotaStatus.codex.hasCreditHeadroom, true);
+		assert.equal(result.quotaStatus.codex.blocked, false);
+		const currentShort = read(type, { ...weekly, used_percent: 10 }, { ...short, used_percent: 100, resets_at: now / 1000 + 60 });
+		assert.equal(resolveModels(config, undefined, ["codex"], { usage: { liveRateLimits: { codex: currentShort } } }).quotaStatus.codex.blocked, true);
+	}
+	assert.equal(read("primary", weekly, short).rateLimitResetsAtSec, weekly.resets_at);
+	assert.equal(read("secondary", weekly, short).rateLimitResetsAtSec, short.resets_at);
+	const unknown = read("weekly", short, null);
+	assert.equal(unknown.rateLimitResetsAtSec, null);
+	assert.equal(resolveModels(config, undefined, ["codex"], { usage: { liveRateLimits: { codex: unknown } } }).quotaStatus.codex.blocked, true);
+});
+
+test("custom token caps require measured totals and preserve known zero", () => {
+	for (const tokens7d of [undefined, null, NaN, Infinity, -1, "0"]) {
+		const runtime = { usage: { byProvider: { codex: { tokens7d } } } };
+		const result = resolveModels(config, undefined, ["codex"], runtime, { weeklyLimits: { codex: "1M" } });
+		assert.equal(result.quotaStatus.codex.tokensIncomplete, true);
+		assert.equal(result.quotaStatus.codex.tokens7dM, null);
+		assert.equal(result.quotaStatus.codex.percentUsed, null);
+		assert.deepEqual(result.models, []);
+		assert.match(formatUsageReport(runtime, result), /token usage unknown\/incomplete/);
+	}
+	assert.deepEqual(resolveModels(config, undefined, ["codex"], null, { weeklyLimits: { codex: "1M" } }).models, []);
+	for (const tokens7d of [0, 999999, 1000000]) {
+		const result = resolveModels(config, undefined, ["codex"], { usage: { byProvider: { codex: { tokens7d } } } }, { weeklyLimits: { codex: "1M" } });
+		assert.equal(result.quotaStatus.codex.tokensIncomplete, false);
+		assert.equal(result.quotaStatus.codex.blocked, tokens7d >= 1000000);
+	}
+});
