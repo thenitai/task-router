@@ -5,7 +5,7 @@ import os from "node:os";
 import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { readClaudeQuota, readProviderBlocks, recordProviderBlock, clearProviderBlock } from "../scripts/provider-quota.mjs";
-import { resolveModels, scanUsageTelemetry, findLatestCodexRateLimits, formatUsageReport } from "../scripts/resolve-models.mjs";
+import { resolveModels, scanUsageTelemetry, findLatestCodexRateLimits, formatUsageReport, formatMarkdown } from "../scripts/resolve-models.mjs";
 
 const config = JSON.parse(fs.readFileSync(new URL("../model.json", import.meta.url), "utf8"));
 const tempHome = (t) => {
@@ -343,7 +343,7 @@ test("weekly dollar caps block incomplete costs but preserve known zero and toke
 	assert.equal(resolve(null).quotaStatus.opencode.blocked, true);
 	const empty = scanUsageTelemetry(home, now);
 	assert.equal(resolve(empty).quotaStatus.opencode.blocked, false);
-	const message = { role: "assistant", providerID: "cloudflare-workers-ai", modelID: "@cf/zai-org/glm-5.3", time: { created: now - 1 }, tokens: { input: 10 } };
+	const message = { role: "assistant", providerID: "cloudflare-workers-ai", modelID: "@cf/zai-org/glm-5.3", time: { created: now - 1 }, tokens: { input: 10, output: 0, cache: { read: 0 } } };
 	execFileSync("sqlite3", [db, `INSERT INTO message VALUES ('${JSON.stringify(message)}');`]);
 	let usage = scanUsageTelemetry(home, now);
 	let result = resolve(usage);
@@ -478,5 +478,89 @@ test("custom token caps require measured totals and preserve known zero", () => 
 		const result = resolveModels(config, undefined, ["codex"], { usage: { byProvider: { codex: { tokens7d } } } }, { weeklyLimits: { codex: "1M" } });
 		assert.equal(result.quotaStatus.codex.tokensIncomplete, false);
 		assert.equal(result.quotaStatus.codex.blocked, tokens7d >= 1000000);
+	}
+});
+
+test("raw OpenCode validation keeps cost and token completeness independent", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const db = path.join(home, ".local", "share", "opencode", "opencode.db");
+	fs.mkdirSync(path.dirname(db), { recursive: true });
+	execFileSync("sqlite3", [db, "CREATE TABLE message (data TEXT);"]);
+	const base = { role: "assistant", providerID: "cloudflare-workers-ai", modelID: "@cf/zai-org/glm-5.3", time: { created: now - 1 }, cost: 0, tokens: { input: 0, output: 0, cache: { read: 0 } } };
+	const scan = (messages) => {
+		execFileSync("sqlite3", [db, `DELETE FROM message; ${messages.map((message) => `INSERT INTO message VALUES ('${JSON.stringify(message)}');`).join(" ")}`]);
+		return scanUsageTelemetry(home, now);
+	};
+	const resolve = (usage, limit, monthly = false) => resolveModels({ ...config, ...(monthly ? { apiBudgets: { cloudflare: { monthlyUsd: 30 } } } : {}) }, undefined, ["opencode"], { usage }, { weeklyLimits: { opencode: limit } });
+	for (const cost of [undefined, null, false, true, "0", "bad", -1, {}, []]) {
+		const usage = scan([{ ...base, cost }]);
+		assert.equal(usage.byProvider.opencode.unknownCost7d, 1, JSON.stringify(cost));
+		assert.equal(usage.byProvider.opencode.unknownTokens7d, 0);
+		assert.equal(usage.apiSpending.cloudflare.complete, false);
+		assert.deepEqual(resolve(usage, 10).models, []);
+		const tokenResult = resolve(usage, "1M");
+		assert.ok(tokenResult.models.length > 0);
+		assert.equal(tokenResult.quotaStatus.opencode.spendingIncomplete, true);
+		assert.equal(tokenResult.quotaStatus.opencode.spent7dUsd, null);
+		for (const report of [formatMarkdown(tokenResult), formatUsageReport({ usage }, tokenResult)]) {
+			assert.match(report, /0M tok \/ 1M \(spending unknown\/incomplete eq\)/);
+			assert.ok(!report.includes("($0 eq)"));
+		}
+		assert.deepEqual(resolve(usage, "1M", true).models, []);
+	}
+	for (const counter of [undefined, null, false, true, "0", "bad", -1, {}, []]) {
+		for (const field of ["input", "output", "cacheRead"]) {
+			const tokens = { ...base.tokens, cache: { read: 0 } };
+			if (field === "cacheRead") tokens.cache.read = counter;
+			else tokens[field] = counter;
+			const usage = scan([{ ...base, tokens }]);
+			assert.equal(usage.byProvider.opencode.unknownTokens7d, 1, `${field}:${JSON.stringify(counter)}`);
+			assert.equal(usage.byProvider.opencode.unknownCost7d, 0);
+			assert.equal(usage.apiSpending.cloudflare.complete, true);
+			assert.deepEqual(resolve(usage, "1M", true).models, []);
+			const dollarResult = resolve(usage, 10, true);
+			assert.ok(dollarResult.models.length > 0);
+			assert.equal(dollarResult.quotaStatus.opencode.tokensIncomplete, true);
+			assert.equal(dollarResult.quotaStatus.opencode.tokens7dM, null);
+			for (const report of [formatMarkdown(dollarResult), formatUsageReport({ usage }, dollarResult)]) {
+				assert.match(report, /\$0 \/ \$10 custom eq cap \(token usage unknown\/incomplete\)/);
+				assert.ok(!report.includes("(0M tok)"));
+			}
+			assert.match(formatUsageReport({ usage }, resolve(usage, 10)), /token usage incomplete/);
+		}
+	}
+	let usage = scan([{ ...base, tokens: undefined }]);
+	assert.deepEqual(resolve(usage, "1M").models, []);
+	usage = scan([base]);
+	assert.equal(usage.byProvider.opencode.tokens7d, 0);
+	assert.ok(resolve(usage, "1M", true).models.length > 0);
+	usage = scan([{ ...base, cost: 1e308 }, { ...base, cost: 1e308 }]);
+	assert.notEqual(usage.apiSpending.cloudflare?.complete, true);
+	assert.deepEqual(resolve(usage, 10, true).models, []);
+	usage = scan([{ ...base, tokens: { input: 1e308, output: 1e308, cache: { read: 0 } } }]);
+	assert.ok(usage.byProvider.opencode?.unknownTokens7d || usage.warnings.length);
+	assert.deepEqual(resolve(usage, "1M").models, []);
+});
+
+test("raw usage completeness follows periods and survives mixed-model aggregation", (t) => {
+	const home = tempHome(t);
+	const now = Date.UTC(2026, 9, 23);
+	const db = path.join(home, ".local", "share", "opencode", "opencode.db");
+	fs.mkdirSync(path.dirname(db), { recursive: true });
+	execFileSync("sqlite3", [db, "CREATE TABLE message (data TEXT);"]);
+	const valid = { role: "assistant", providerID: "cloudflare-workers-ai", modelID: "@cf/zai-org/glm-5.3", time: { created: now - 1 }, cost: 3, tokens: { input: 5, output: 5, cache: { read: 0 } } };
+	for (const [created, weeklyUnknown, monthUnknown] of [[now - 2, true, true], [now - 8 * 86400000, false, true], [Date.UTC(2026, 8, 1), false, false], [undefined, true, true], [true, true, true]]) {
+		const invalid = { ...valid, modelID: "@cf/zai-org/glm-5.3-flash", cost: false, tokens: undefined, time: { created } };
+		execFileSync("sqlite3", [db, `DELETE FROM message; INSERT INTO message VALUES ('${JSON.stringify(valid)}'), ('${JSON.stringify(invalid)}');`]);
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(usage.byProvider.opencode.unknownTokens7d, Number(weeklyUnknown));
+		assert.equal(usage.byProvider.opencode.unknownCost7d, Number(weeklyUnknown));
+		assert.equal(usage.apiSpending.cloudflare.complete, !monthUnknown);
+		assert.equal(usage.apiSpending.cloudflare.spentUsd, 3);
+		for (const limit of [10, "1M"]) {
+			const result = resolveModels(config, undefined, ["opencode"], { usage }, { weeklyLimits: { opencode: limit } });
+			assert.equal(result.quotaStatus.opencode.blocked, weeklyUnknown);
+		}
 	}
 });

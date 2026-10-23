@@ -341,10 +341,11 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 	const ocDbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
 	if (fs.existsSync(ocDbPath)) {
 		try {
+			const numericField = (field) => `COALESCE(json_type(data, '$.${field}') IN ('integer', 'real') AND json_extract(data, '$.${field}') >= 0 AND json_extract(data, '$.${field}') <= ${Number.MAX_VALUE}, 0)`;
 			const periods = [["Total", "1"], ["30d", `ts >= ${thirtyDaysAgo}`], ["7d", `ts >= ${sevenDaysAgo}`]];
 			const sums = periods.flatMap(([suffix, condition]) => [
 				`SUM(CASE WHEN ${condition} AND known_cost THEN cost ELSE 0 END) AS usd${suffix}`,
-				`SUM(CASE WHEN ${condition} THEN input + cache_read + output ELSE 0 END) AS tokens${suffix}`,
+				`SUM(CASE WHEN ${condition} AND known_tokens THEN input + cache_read + output ELSE 0 END) AS tokens${suffix}`,
 				`SUM(CASE WHEN ${condition} THEN 1 ELSE 0 END) AS turns${suffix}`,
 			]);
 			const sql = `WITH raw AS (
@@ -356,16 +357,19 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 				json_extract(data, '$.time.created') AS created, json_extract(data, '$.cost') AS cost,
 				COALESCE(json_extract(data, '$.tokens.input'), 0) AS input,
 				COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS cache_read,
-				COALESCE(json_extract(data, '$.tokens.output'), 0) AS output
+				COALESCE(json_extract(data, '$.tokens.output'), 0) AS output,
+				${numericField('cost')} AS known_cost, ${numericField('time.created')} AS known_created,
+				${['tokens.input', 'tokens.cache.read', 'tokens.output'].map(numericField).join(' AND ')} AS known_tokens
 				FROM message WHERE json_extract(data, '$.role') = 'assistant'
 			), usage AS (
-				SELECT *, CASE WHEN typeof(created) IN ('integer', 'real') AND created > 0 AND created <= ${nowMs} THEN created END AS ts,
-				(typeof(cost) IN ('integer', 'real') AND cost >= 0) AS known_cost FROM raw
+				SELECT *, CASE WHEN known_created AND created > 0 AND created <= ${nowMs} THEN created END AS ts FROM raw
 			)
 			SELECT model, ${sums.join(", ")},
-				SUM(CASE WHEN ts >= ${sevenDaysAgo} THEN input ELSE 0 END) AS inTok7d,
-				SUM(CASE WHEN ts >= ${sevenDaysAgo} THEN cache_read ELSE 0 END) AS cacheRead7d,
-				SUM(CASE WHEN ts >= ${sevenDaysAgo} THEN output ELSE 0 END) AS outTok7d,
+				SUM(CASE WHEN ts >= ${sevenDaysAgo} AND known_tokens THEN input ELSE 0 END) AS inTok7d,
+				SUM(CASE WHEN ts >= ${sevenDaysAgo} AND known_tokens THEN cache_read ELSE 0 END) AS cacheRead7d,
+				SUM(CASE WHEN ts >= ${sevenDaysAgo} AND known_tokens THEN output ELSE 0 END) AS outTok7d,
+				MAX(NOT known_tokens) AS unknownTokens,
+				MAX(ts IS NULL OR (ts >= ${sevenDaysAgo} AND NOT known_tokens)) AS unknownTokens7d,
 				MAX(NOT known_cost) AS unknownCost,
 				MAX(ts IS NULL OR (ts >= ${sevenDaysAgo} AND NOT known_cost)) AS unknownCost7d,
 				SUM(CASE WHEN ts >= ${monthStartMs} AND known_cost THEN cost ELSE 0 END) AS monthUsd,
@@ -374,9 +378,13 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 			// Return one row per model, so message history cannot overflow the child-process buffer.
 			const rawRows = execFileSync("sqlite3", ["-readonly", "-json", ocDbPath, sql], { encoding: "utf8", timeout: 3000 }).trim();
 			const rows = rawRows ? JSON.parse(rawRows) : [];
-			byProvider.opencode ??= { usd7d: 0, tokens7d: 0, unknownCost7d: 0 };
+			byProvider.opencode ??= { usd7d: 0, tokens7d: 0, unknownCost7d: 0, unknownTokens7d: 0 };
 			apiSpending.cloudflare = { monthStart: new Date(monthStartMs).toISOString(), spentUsd: 0, complete: true, sourceFile: ocDbPath };
 			for (const { model, monthUsd, monthIncomplete, ...totals } of rows) {
+				for (const [unit, flag] of [["usd", "unknownCost"], ["tokens", "unknownTokens"]]) {
+					if (!Number.isFinite(totals[`${unit}Total`])) totals[flag] = 1;
+					if (!Number.isFinite(totals[`${unit}7d`])) totals[`${flag}7d`] = 1;
+				}
 				const prov = "opencode";
 				byModel[`${prov}:${model}`] = { provider: prov, model, billing: "api", ...totals };
 				byProvider[prov] ??= {};
@@ -387,10 +395,10 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 					}
 					byProvider[prov][key] = (byProvider[prov][key] || 0) + value;
 				}
-				if (model.startsWith("unknown/") && (monthIncomplete || monthUsd > 0)) apiSpending.cloudflare.complete = false;
+				if (model.startsWith("unknown/") && (monthIncomplete || !Number.isFinite(monthUsd) || monthUsd > 0)) apiSpending.cloudflare.complete = false;
 				if (model.startsWith("cloudflare-workers-ai/")) {
-					apiSpending.cloudflare.spentUsd += monthUsd;
-					if (monthIncomplete) apiSpending.cloudflare.complete = false;
+					if (Number.isFinite(monthUsd)) apiSpending.cloudflare.spentUsd += monthUsd;
+					if (monthIncomplete || !Number.isFinite(monthUsd) || !Number.isFinite(apiSpending.cloudflare.spentUsd)) apiSpending.cloudflare.complete = false;
 				}
 			}
 		} catch { warnings.push("OpenCode spending unavailable: cannot read local database"); }
@@ -630,10 +638,11 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const spent7d = useWindowStats ? runtimeState.usage.byProvider[prov].usdWindow : (runtimeState?.usage?.byProvider?.[prov]?.usd7d ?? 0);
 		const tokens7d = useWindowStats ? runtimeState.usage.byProvider[prov].tokensWindow : (runtimeState?.usage?.byProvider?.[prov]?.tokens7d ?? 0);
 		const currentVal = isTokenLimit ? tokens7d : spent7d;
-		const spendingIncomplete = customLimit && !isTokenLimit && (!Number.isFinite(runtimeState?.usage?.byProvider?.[prov]?.usd7d)
+		const spendingIncomplete = (!Number.isFinite(runtimeState?.usage?.byProvider?.[prov]?.usd7d)
 			|| spent7d < 0 || Boolean(runtimeState?.usage?.byProvider?.[prov]?.unknownCost7d));
-		const tokensIncomplete = customLimit && isTokenLimit && (!Number.isFinite(runtimeState?.usage?.byProvider?.[prov]?.tokens7d) || tokens7d < 0);
-		const estimatedPercentUsed = !spendingIncomplete && !tokensIncomplete && runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
+		const tokensIncomplete = (!Number.isFinite(runtimeState?.usage?.byProvider?.[prov]?.tokens7d) || tokens7d < 0 || Boolean(runtimeState?.usage?.byProvider?.[prov]?.unknownTokens7d));
+		const usageIncomplete = isTokenLimit ? tokensIncomplete : spendingIncomplete;
+		const estimatedPercentUsed = !usageIncomplete && runtimeState?.usage?.byProvider?.[prov] && limitVal > 0 ? Math.round((currentVal / limitVal) * 100) : null;
 		const liveServerReported = !customLimit && Number.isFinite(liveLimit?.usedPercent);
 		const pct = liveServerReported ? liveLimit.usedPercent : customLimit ? estimatedPercentUsed : null;
 
@@ -646,7 +655,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		const reportedBlock = liveLimit?.rateLimitReached && (liveLimit.rateLimitResetsAtSec == null || liveLimit.rateLimitResetsAtSec * 1000 > nowMs);
 		const hasCreditHeadroom = Boolean(currentCreditReading && liveLimit.hasCredits === true && creditsBalance > 0 && !reportedBlock && !customLimit && !options.autoThrottle);
 		const exhausted = windows.some((w) => w.usedPercent >= 100) || (liveServerReported && liveLimit.usedPercent >= 100);
-		const blocked = spendingIncomplete || tokensIncomplete || blockedProviders.has(prov) || Boolean(reportedBlock) || (exhausted && !hasCreditHeadroom) || (customLimit && limitVal >= 0 && currentVal >= limitVal);
+		const blocked = (customLimit && usageIncomplete) || blockedProviders.has(prov) || Boolean(reportedBlock) || (exhausted && !hasCreditHeadroom) || (customLimit && limitVal >= 0 && currentVal >= limitVal);
 		if (blocked) blockedProviders.add(prov);
 		const isOnlyActiveSub = enabledSubProviders.length === 1 && enabledSubProviders[0] === prov && !customLimit && !options.autoThrottle && !reportedBlock;
 		const overThreshold = pct !== null && pct >= budgetCfg.autoDowngradeAbovePercent;
@@ -826,9 +835,11 @@ function formatQuotaStatus(resolved) {
 		if (q.status === "no-subscription") return `\`${prov}\`: **No subscription**`;
 		if (q.status === "disabled") return `\`${prov}\` ($${q.planMonthlyUsd}/mo configured): **Provider disabled**`;
 		const planTag = q.planMonthlyUsd ? `$${q.planMonthlyUsd}/mo plan` : "custom limit";
-		const label = q.tokensIncomplete ? "token usage unknown/incomplete" : q.spendingIncomplete ? "spending unknown/incomplete" : q.customLimit
-			? q.unit === "tokens" ? `${q.tokens7dM}M / ${q.weeklyLimit} tok ($${q.spent7dUsd} eq)` : `$${q.spent7dUsd} / $${String(q.weeklyLimit).replace(/^\$/, "")} custom eq cap (${q.tokens7dM}M tok)`
-			: `$${q.spent7dUsd} eq (${q.tokens7dM}M tok)`;
+		const dollars = q.spendingIncomplete ? "spending unknown/incomplete" : `$${q.spent7dUsd}`;
+		const tokens = q.tokensIncomplete ? "token usage unknown/incomplete" : `${q.tokens7dM}M tok`;
+		const label = q.customLimit
+			? q.unit === "tokens" ? `${tokens} / ${q.weeklyLimit} (${dollars} eq)` : `${dollars} / $${String(q.weeklyLimit).replace(/^\$/, "")} custom eq cap (${tokens})`
+			: `${dollars} eq (${tokens})`;
 		const creditNote = prov === "codex" || q.creditsBalance != null
 			? `; credits: ${q.creditsBalance == null ? "unknown" : q.creditsBalance.toLocaleString("en-US", { maximumFractionDigits: 2 })}${q.hasCreditHeadroom ? " (available; quota-based demotion bypassed)" : " (no credit headroom applied)"}` : "";
 		const resetNote = q.resetsAt ? `, resets ${q.resetsAt}` : "";
@@ -920,8 +931,9 @@ export function formatUsageReport(runtimeState, resolved) {
 		const inM = (m.inTok7d / 1e6).toFixed(1);
 		const cacheM = (m.cacheRead7d / 1e6).toFixed(1);
 		const outM = (m.outTok7d / 1e6).toFixed(2);
+		const tokenTag = m.unknownTokens7d ? "unknown/incomplete" : `${tokM}M (${inM}M / ${cacheM}M / ${outM}M)`;
 		const costTag = m.billing === "api" ? m.unknownCost7d ? "unknown/incomplete" : `$${m.usd7d.toFixed(2)} locally recorded` : `$${m.usd7d.toFixed(2)} sub-eq`;
-		lines.push(`| \`${m.provider}\` | \`${m.model}\` | \`${m.billing}\` | ${m.turns7d} (${turnPct}%) | ${tokM}M (${inM}M / ${cacheM}M / ${outM}M) | **${costTag}** (${m.unknownCost7d ? "unknown" : `${costPct}%`}) | ${m.unknownCost ? "unknown/incomplete" : `$${m.usdTotal.toFixed(2)}`} |`);
+		lines.push(`| \`${m.provider}\` | \`${m.model}\` | \`${m.billing}\` | ${m.turns7d} (${turnPct}%) | ${tokenTag} | **${costTag}** (${m.unknownCost7d ? "unknown" : `${costPct}%`}) | ${m.unknownCost ? "unknown/incomplete" : `$${m.usdTotal.toFixed(2)}`} |`);
 	}
 
 	const astraEntry = models.find((m) => m.model === "gpt-6-astra");
@@ -940,7 +952,7 @@ export function formatUsageReport(runtimeState, resolved) {
 	lines.push("");
 	lines.push("| Configured plan option | Monthly subscriptions | Included capacity |", "| :--- | :--- | :--- |");
 	for (const [openai, claude] of [[200, 0], [100, 100], [20, 100], [20, 20]]) lines.push(`| openai=${openai}, claude=${claude} | $${openai + claude}/mo | Verify provider dashboards; cannot derive from API prices |`);
-	lines.push(`\nGoogle API token-price scenario: ~$${Math.round(googleArgonWeeklyApiCost * 4.3)}/month at the observed token volume. Subscription fees, metered API spend, and quota percentages are separate.`);
+	lines.push(`\nGoogle API token-price scenario: ${models.some((m) => m.unknownTokens7d) ? "unavailable (token usage incomplete)" : `~$${Math.round(googleArgonWeeklyApiCost * 4.3)}/month at the observed token volume`}. Subscription fees, metered API spend, and quota percentages are separate.`);
 
 	return lines.join("\n");
 }

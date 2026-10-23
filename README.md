@@ -28,7 +28,7 @@ OpenCode is the harness. Cloudflare Workers AI is metered API spending, independ
 
 - `apiBudgets.cloudflare.monthlyUsd: 0` blocks paid Cloudflare dispatch.
 - A positive amount sets a local UTC calendar-month dispatch budget, using Cloudflare-only costs recorded in this machine's OpenCode database.
-- Missing/incomplete spending blocks new Cloudflare dispatch under a configured budget. Missing costs and undated/invalid Cloudflare records make spending incomplete. They are not treated as zero. A recorded zero remains zero.
+- Missing/incomplete spending blocks new Cloudflare dispatch under a configured budget. Missing costs and undated/invalid Cloudflare records make spending incomplete. They are not treated as zero. A recorded numeric zero remains zero. Boolean, text, negative, or non-finite costs are incomplete. Token limits independently require numeric input, output, and cache-read counts; absent or invalid counters are incomplete, without making a known dollar cost unknown.
 - Omitting the budget preserves existing routing behavior. It is not a provider billing cap: other machines, outside applications, missing records, and work already running can affect the final invoice.
 
 Nested objects merge with bundled defaults; arrays/scalars replace. `models` replaces the entire default pattern list; an empty list clears it. The first existing personal file wins:
