@@ -259,83 +259,126 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 	const warnings = [];
 	const monthStartMs = Date.UTC(new Date(nowMs).getUTCFullYear(), new Date(nowMs).getUTCMonth(), 1);
 
+	const cacheProblems = new Map();
+	let invalidCacheRecords = 0;
+	const noteCacheProblem = (prov = null, ts = null) => {
+		invalidCacheRecords++;
+		for (const provider of prov ? [prov] : ["codex", "claudeAgent", "opencode"]) {
+			cacheProblems.set(provider, cacheProblems.get(provider) || ts === null || ts >= sevenDaysAgo);
+		}
+	};
 	let cachedUsage = null;
 	for (const usagePath of usagePaths) {
 		if (!fs.existsSync(usagePath)) continue;
 		try {
 			cachedUsage = JSON.parse(fs.readFileSync(usagePath, "utf8"));
-			if (!cachedUsage.files || !Array.isArray(cachedUsage.models)) { cachedUsage = null; continue; }
+			if (!cachedUsage || !cachedUsage.files || typeof cachedUsage.files !== "object" || Array.isArray(cachedUsage.files) || !Array.isArray(cachedUsage.models)) throw new Error("Invalid usage cache");
 			for (const [filePath, fileEntry] of Object.entries(cachedUsage.files || {})) {
-				if (fileEntry.p === "codex" && fs.existsSync(filePath)) existingCodexFiles.push(filePath);
+				if (fileEntry?.p === "codex" && fs.existsSync(filePath)) existingCodexFiles.push(filePath);
 			}
 			break;
-		} catch { warnings.push(`Cannot read usage cache ${usagePath}`); }
+		} catch {
+			cachedUsage = null;
+			noteCacheProblem();
+			warnings.push(`Cannot read usage cache ${usagePath}`);
+		}
 	}
 	const codexLive = findLatestCodexRateLimits(homeDir, existingCodexFiles, nowMs);
 	if (codexLive) liveRateLimits.codex = codexLive;
 	if (cachedUsage) {
-		try {
-			const data = cachedUsage;
-			const codexWindowStartMs = codexLive?.windowStartMs ? Math.max(sevenDaysAgo, codexLive.windowStartMs) : sevenDaysAgo;
-			const seen = new Set();
+		const data = cachedUsage;
+		const codexWindowStartMs = codexLive?.windowStartMs ? Math.max(sevenDaysAgo, codexLive.windowStartMs) : sevenDaysAgo;
+		const seen = new Set();
 
-			for (const [, fileEntry] of Object.entries(data.files || {})) {
-				const rawProv = fileEntry.p || "unknown";
-				const prov = rawProv === "claude" ? "claudeAgent" : rawProv;
+		for (const [, fileEntry] of Object.entries(data.files || {})) {
+			if (!fileEntry || typeof fileEntry !== "object" || Array.isArray(fileEntry)) { noteCacheProblem(); continue; }
+			const normalized = typeof fileEntry.p === "string" ? normalizeProvider(fileEntry.p) : null;
+			const prov = ["codex", "claudeAgent", "opencode"].includes(normalized) ? normalized : null;
+			const rows = [];
+			for (const field of ["r", "t"]) {
+				if (fileEntry[field] === undefined) continue;
+				if (Array.isArray(fileEntry[field])) {
+					for (const row of fileEntry[field]) rows.push(row);
+				}
+				else noteCacheProblem(prov);
+			}
 
-				for (const row of [...(fileEntry.r || []), ...(fileEntry.t || [])]) {
-					const [ts, mIdx, , uncached = 0, cacheRead = 0, cacheCreation = 0, outTok = 0] = row;
-					if (ts > nowMs) continue;
-					const key = row[8] == null ? null : `${prov}:${row[8]}`;
-					if (key !== null && seen.has(key)) continue;
-					if (key !== null) seen.add(key);
-					const inTok = uncached + cacheCreation;
-					const modelSlug = data.models?.[mIdx] || "unknown";
-					const known = CANONICAL_MODELS.find((c) => canonicalBaseKey(c.id) === canonicalBaseKey(modelSlug));
-					const rates = known?.cost || { input: 2, output: 10, cacheRead: 0.1 };
-					const turnCostUsd = (inTok / 1e6) * (rates.input || 0) + (cacheRead / 1e6) * (rates.cacheRead || 0) + (outTok / 1e6) * (rates.output || 0);
-					const totalTokens = (inTok || 0) + (cacheRead || 0) + (outTok || 0);
+			if (!prov && rows.length === 0) noteCacheProblem();
+			for (const row of rows) {
+				const ts = Number.isFinite(row?.[0]) && row[0] > 0 && row[0] <= nowMs ? row[0] : null;
+				if (!Array.isArray(row) || row.length < 7 || ts === null
+					|| !Number.isInteger(row[1]) || row[1] < 0 || typeof data.models[row[1]] !== "string" || !data.models[row[1]].trim()
+					|| ![3, 4, 5, 6].every((index) => Number.isFinite(row[index]) && row[index] >= 0)
+					|| (row[8] != null && !(typeof row[8] === "string" && row[8].trim()) && !(typeof row[8] === "number" && Number.isFinite(row[8])))) {
+					noteCacheProblem(prov, ts);
+					continue;
+				}
+				if (!prov) { noteCacheProblem(null, ts); continue; }
+				const [, mIdx, , uncached, cacheRead, cacheCreation, outTok] = row;
+				const key = row[8] == null ? null : `${prov}:${JSON.stringify(row[8])}`;
+				if (key !== null && seen.has(key)) continue;
+				const inTok = uncached + cacheCreation;
+				const modelSlug = data.models?.[mIdx] || "unknown";
+				const known = CANONICAL_MODELS.find((c) => canonicalBaseKey(c.id) === canonicalBaseKey(modelSlug));
+				const rates = known?.cost || { input: 2, output: 10, cacheRead: 0.1 };
+				const turnCostUsd = (inTok / 1e6) * (rates.input || 0) + (cacheRead / 1e6) * (rates.cacheRead || 0) + (outTok / 1e6) * (rates.output || 0);
+				const totalTokens = inTok + cacheRead + outTok;
+				if (!Number.isFinite(totalTokens) || !Number.isFinite(turnCostUsd)) {
+					noteCacheProblem(prov, ts);
+					continue;
+				}
+				if (key !== null) seen.add(key);
 
-					if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usdWindow: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensWindow: 0, tokens30d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turns30d: 0, turnsTotal: 0 };
-					byProvider[prov].usdTotal += turnCostUsd;
-					byProvider[prov].tokensTotal += totalTokens;
-					byProvider[prov].turnsTotal += 1;
-					if (ts >= thirtyDaysAgo) {
-						byProvider[prov].usd30d += turnCostUsd;
-						byProvider[prov].tokens30d += totalTokens;
-						byProvider[prov].turns30d += 1;
-					}
-					if (ts >= sevenDaysAgo) {
-						byProvider[prov].usd7d += turnCostUsd;
-						byProvider[prov].tokens7d += totalTokens;
-						byProvider[prov].inTok7d += inTok || 0;
-						byProvider[prov].cacheRead7d += cacheRead || 0;
-						byProvider[prov].outTok7d += outTok || 0;
-						byProvider[prov].turns7d += 1;
-					}
-					const windowCutoff = prov === "codex" ? codexWindowStartMs : sevenDaysAgo;
-					if (ts >= windowCutoff) {
-						byProvider[prov].usdWindow += turnCostUsd;
-						byProvider[prov].tokensWindow += totalTokens;
-					}
+				if (!byProvider[prov]) byProvider[prov] = { usd7d: 0, usdWindow: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensWindow: 0, tokens30d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turns30d: 0, turnsTotal: 0 };
+				byProvider[prov].usdTotal += turnCostUsd;
+				byProvider[prov].tokensTotal += totalTokens;
+				byProvider[prov].turnsTotal += 1;
+				if (ts >= thirtyDaysAgo) {
+					byProvider[prov].usd30d += turnCostUsd;
+					byProvider[prov].tokens30d += totalTokens;
+					byProvider[prov].turns30d += 1;
+				}
+				if (ts >= sevenDaysAgo) {
+					byProvider[prov].usd7d += turnCostUsd;
+					byProvider[prov].tokens7d += totalTokens;
+					byProvider[prov].inTok7d += inTok || 0;
+					byProvider[prov].cacheRead7d += cacheRead || 0;
+					byProvider[prov].outTok7d += outTok || 0;
+					byProvider[prov].turns7d += 1;
+				}
+				const windowCutoff = prov === "codex" ? codexWindowStartMs : sevenDaysAgo;
+				if (ts >= windowCutoff) {
+					byProvider[prov].usdWindow += turnCostUsd;
+					byProvider[prov].tokensWindow += totalTokens;
+				}
 
-					const mKey = `${prov}:${modelSlug}`;
-					if (!byModel[mKey]) byModel[mKey] = { provider: prov, model: modelSlug, billing: "subscription", usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turnsTotal: 0 };
-					byModel[mKey].usdTotal += turnCostUsd;
-					byModel[mKey].tokensTotal += totalTokens;
-					byModel[mKey].turnsTotal += 1;
-					if (ts >= thirtyDaysAgo) byModel[mKey].usd30d += turnCostUsd;
-					if (ts >= sevenDaysAgo) {
-						byModel[mKey].usd7d += turnCostUsd;
-						byModel[mKey].tokens7d += totalTokens;
-						byModel[mKey].inTok7d += inTok || 0;
-						byModel[mKey].cacheRead7d += cacheRead || 0;
-						byModel[mKey].outTok7d += outTok || 0;
-						byModel[mKey].turns7d += 1;
-					}
+				const mKey = `${prov}:${modelSlug}`;
+				if (!byModel[mKey]) byModel[mKey] = { provider: prov, model: modelSlug, billing: "subscription", usd7d: 0, usd30d: 0, usdTotal: 0, tokens7d: 0, tokensTotal: 0, inTok7d: 0, cacheRead7d: 0, outTok7d: 0, turns7d: 0, turnsTotal: 0 };
+				byModel[mKey].usdTotal += turnCostUsd;
+				byModel[mKey].tokensTotal += totalTokens;
+				byModel[mKey].turnsTotal += 1;
+				if (ts >= thirtyDaysAgo) byModel[mKey].usd30d += turnCostUsd;
+				if (ts >= sevenDaysAgo) {
+					byModel[mKey].usd7d += turnCostUsd;
+					byModel[mKey].tokens7d += totalTokens;
+					byModel[mKey].inTok7d += inTok || 0;
+					byModel[mKey].cacheRead7d += cacheRead || 0;
+					byModel[mKey].outTok7d += outTok || 0;
+					byModel[mKey].turns7d += 1;
 				}
 			}
-		} catch {}
+		}
+	}
+
+	if (invalidCacheRecords) {
+		warnings.push(`T3 usage incomplete: ${invalidCacheRecords} invalid cache records or containers`);
+		for (const [provider, weeklyUnknown] of cacheProblems) {
+			byProvider[provider] ??= {};
+			for (const stats of [byProvider[provider], ...Object.values(byModel).filter((model) => model.provider === provider)]) {
+				stats.unknownCost = stats.unknownTokens = 1;
+				if (weeklyUnknown) stats.unknownCost7d = stats.unknownTokens7d = 1;
+			}
+		}
 	}
 
 	const ocDbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
@@ -910,7 +953,6 @@ export function formatUsageReport(runtimeState, resolved) {
 
 	const models = Object.values(usage.byModel || {}).sort((a, b) => b.usdTotal - a.usdTotal);
 	const totalTurns7d = models.reduce((s, m) => s + m.turns7d, 0) || 1;
-	const totalTok7d = models.reduce((s, m) => s + m.tokens7d, 0) || 1;
 	const totalUsd7d = models.reduce((s, m) => s + m.usd7d, 0) || 0.01;
 
 	const lines = [
@@ -932,13 +974,15 @@ export function formatUsageReport(runtimeState, resolved) {
 		const cacheM = (m.cacheRead7d / 1e6).toFixed(1);
 		const outM = (m.outTok7d / 1e6).toFixed(2);
 		const tokenTag = m.unknownTokens7d ? "unknown/incomplete" : `${tokM}M (${inM}M / ${cacheM}M / ${outM}M)`;
-		const costTag = m.billing === "api" ? m.unknownCost7d ? "unknown/incomplete" : `$${m.usd7d.toFixed(2)} locally recorded` : `$${m.usd7d.toFixed(2)} sub-eq`;
+		const costTag = m.unknownCost7d ? "unknown/incomplete" : m.billing === "api" ? `$${m.usd7d.toFixed(2)} locally recorded` : `$${m.usd7d.toFixed(2)} sub-eq`;
 		lines.push(`| \`${m.provider}\` | \`${m.model}\` | \`${m.billing}\` | ${m.turns7d} (${turnPct}%) | ${tokenTag} | **${costTag}** (${m.unknownCost7d ? "unknown" : `${costPct}%`}) | ${m.unknownCost ? "unknown/incomplete" : `$${m.usdTotal.toFixed(2)}`} |`);
 	}
 
 	const astraEntry = models.find((m) => m.model === "gpt-6-astra");
 	const solIfReplacedUsd = astraEntry ? (astraEntry.inTok7d / 1e6) * 2 + (astraEntry.cacheRead7d / 1e6) * 0.1 + (astraEntry.outTok7d / 1e6) * 10 : 0;
 	const currentCodex7d = usage.byProvider?.codex?.usd7d || 0;
+	const codexCostsIncomplete = Boolean(usage.byProvider?.codex?.unknownCost7d) || !Number.isFinite(currentCodex7d)
+		|| models.some((m) => m.provider === "codex" && m.unknownCost7d);
 	const optimizedCodex7d = astraEntry ? currentCodex7d - astraEntry.usd7d + solIfReplacedUsd : currentCodex7d;
 	const total7dInTok = models.reduce((s, m) => s + m.inTok7d, 0);
 	const total7dCacheTok = models.reduce((s, m) => s + m.cacheRead7d, 0);
@@ -947,12 +991,12 @@ export function formatUsageReport(runtimeState, resolved) {
 
 	lines.push("");
 	lines.push("### 2. Model Cost Scenario (API-equivalent estimates, not subscription quota)");
-	lines.push(`- **Current 7d Codex API-equivalent cost:** **$${currentCodex7d.toFixed(2)}**. Local logs do not establish which sessions were coordinators.`);
-	lines.push(`- **If the same Astra token volume used Sol instead:** **$${optimizedCodex7d.toFixed(2)}** total estimated Codex cost. This is a pricing scenario, not evidence of equal task quality or included subscription capacity.`);
+	lines.push(`- **Current 7d Codex API-equivalent cost:** **${codexCostsIncomplete ? "unknown/incomplete" : `$${currentCodex7d.toFixed(2)}`}**. Local logs do not establish which sessions were coordinators.`);
+	lines.push(`- **If the same Astra token volume used Sol instead:** **${codexCostsIncomplete || astraEntry?.unknownTokens7d ? "unavailable (usage incomplete)" : `$${optimizedCodex7d.toFixed(2)}`}** total estimated Codex cost. This is a pricing scenario, not evidence of equal task quality or included subscription capacity.`);
 	lines.push("");
 	lines.push("| Configured plan option | Monthly subscriptions | Included capacity |", "| :--- | :--- | :--- |");
 	for (const [openai, claude] of [[200, 0], [100, 100], [20, 100], [20, 20]]) lines.push(`| openai=${openai}, claude=${claude} | $${openai + claude}/mo | Verify provider dashboards; cannot derive from API prices |`);
-	lines.push(`\nGoogle API token-price scenario: ${models.some((m) => m.unknownTokens7d) ? "unavailable (token usage incomplete)" : `~$${Math.round(googleArgonWeeklyApiCost * 4.3)}/month at the observed token volume`}. Subscription fees, metered API spend, and quota percentages are separate.`);
+	lines.push(`\nGoogle API token-price scenario: ${(models.some((m) => m.unknownTokens7d) || Object.values(usage.byProvider || {}).some((provider) => provider.unknownTokens7d)) ? "unavailable (token usage incomplete)" : `~$${Math.round(googleArgonWeeklyApiCost * 4.3)}/month at the observed token volume`}. Subscription fees, metered API spend, and quota percentages are separate.`);
 
 	return lines.join("\n");
 }

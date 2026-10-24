@@ -564,3 +564,101 @@ test("raw usage completeness follows periods and survives mixed-model aggregatio
 		}
 	}
 });
+
+test("T3 malformed records retain later usage and block caps on partial totals", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const cache = path.join(home, ".t3", "userdata", "usage-scan-cache-v9.json");
+	const row = (id, input = 1, ts = now - 1) => [ts, 0, 0, input, 0, 0, 0, 0, id];
+	const scan = (files) => {
+		writeJson(cache, { models: ["gpt-6.1-sol"], files });
+		return scanUsageTelemetry(home, now);
+	};
+	for (const bad of [null, {}, [], row("bad", "0"), row("bad", false), row("bad", -1), row("bad", null), row("bad", 1, true), row("bad", 1, now + 1), [now - 1, 99, 0, 0, 0, 0, 0]]) {
+		const usage = scan({ session: { p: "codex", r: [row("first"), bad], t: [row("large", 5e6)] } });
+		assert.equal(usage.byProvider.codex.turns7d, 2);
+		assert.equal(usage.byProvider.codex.usd7d, 10.000002);
+		assert.equal(usage.byProvider.codex.unknownCost7d, 1);
+		assert.equal(usage.byProvider.codex.unknownTokens7d, 1);
+		assert.match(usage.warnings.join(" "), /T3 usage incomplete/);
+		for (const cap of [20, "10M"]) {
+			const result = resolveModels(config, undefined, ["codex"], { usage }, { weeklyLimits: { codex: cap } });
+			assert.deepEqual(result.models, []);
+			for (const report of [formatMarkdown(result), formatUsageReport({ usage }, result)]) assert.match(report, /unknown\/incomplete/);
+			const report = formatUsageReport({ usage }, result);
+			assert.match(report, /Current 7d Codex API-equivalent cost:\*\* \*\*unknown\/incomplete/);
+			assert.match(report, /Astra token volume used Sol instead:\*\* \*\*unavailable \(usage incomplete\)/);
+		}
+	}
+	const usage = scan({ old: { p: "codex", r: [row("old-bad", -1, now - 8 * 86400000)] }, current: { p: "codex", r: [row("valid")] } });
+	assert.equal(usage.byProvider.codex.unknownCost, 1);
+	assert.ok(!usage.byProvider.codex.unknownCost7d);
+	assert.ok(resolveModels(config, undefined, ["codex"], { usage }, { weeklyLimits: { codex: 20 } }).models.length > 0);
+});
+
+test("T3 damaged containers and newer cache failures cannot hide partial usage", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const dir = path.join(home, ".t3", "userdata");
+	const cache = path.join(dir, "usage-scan-cache-v9.json");
+	const row = [now - 1, 0, 0, 1, 0, 0, 0, 0, "good"];
+	for (const badEntry of [null, { p: false }, { p: "unknown", r: [null] }, { p: "codxe", r: [row] }, { p: "__proto__" }, { p: "codex", r: {} }, { p: "codex", t: "bad" }]) {
+		writeJson(cache, { models: ["gpt-6.1-sol"], files: { bad: badEntry, good: { p: "codex", r: [row] } } });
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(usage.byProvider.codex.turns7d, 1);
+		assert.equal(usage.byProvider.codex.unknownCost7d, 1);
+		assert.ok(usage.warnings.length);
+		assert.deepEqual(resolveModels(config, undefined, ["codex"], { usage }, { weeklyLimits: { codex: "1M" } }).models, []);
+	}
+	writeJson(path.join(dir, "usage-scan-cache-v5.json"), { models: ["gpt-6.1-sol"], files: { good: { p: "codex", r: [row] } } });
+	for (const content of ["{broken", "null", JSON.stringify({ models: [], files: [] })]) {
+		fs.writeFileSync(cache, content);
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(usage.byProvider.codex.turns7d, 1);
+		assert.equal(usage.byProvider.codex.unknownCost7d, 1);
+		assert.deepEqual(resolveModels(config, undefined, ["codex"], { usage }, { weeklyLimits: { codex: 20 } }).models, []);
+	}
+});
+
+test("T3 malformed dedupe keys cannot collide or abort later records", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const cache = path.join(home, ".t3", "userdata", "usage-scan-cache-v9.json");
+	const row = (key, input) => [now - 1, 0, 0, input, 0, 0, 0, 0, key];
+	for (const key of [{}, { toString: null }, [], false, "", "   "]) {
+		writeJson(cache, { models: ["gpt-6.1-sol"], files: { session: { p: "codex", r: [row("first", 1), row(key, 5e6), row("large", 5e6)] } } });
+		const usage = scanUsageTelemetry(home, now);
+		assert.equal(usage.byProvider.codex.turns7d, 2);
+		assert.equal(usage.byProvider.codex.usd7d, 10.000002);
+		assert.equal(usage.byProvider.codex.unknownCost7d, 1);
+		assert.deepEqual(resolveModels(config, undefined, ["codex"], { usage }, { weeklyLimits: { codex: 20 } }).models, []);
+	}
+	writeJson(cache, { models: ["gpt-6.1-sol"], files: { session: { p: "codex", r: [row(1, 1), row("1", 2), row(1, 1), row(null, 0)] } } });
+	const usage = scanUsageTelemetry(home, now);
+	assert.equal(usage.byProvider.codex.turns7d, 3);
+	assert.equal(usage.byProvider.codex.tokens7d, 3);
+	assert.deepEqual(usage.warnings, []);
+});
+
+test("T3 provider-only incompleteness suppresses pricing scenarios without poisoning known old dates", (t) => {
+	const home = tempHome(t);
+	const now = Date.now();
+	const cache = path.join(home, ".t3", "userdata", "usage-scan-cache-v9.json");
+	const row = (ts) => [ts, 0, 0, 1e6, 0, 0, 0, 0, "good"];
+	for (const files of [
+		{ bad: { p: "claude", r: [null] }, good: { p: "codex", r: [row(now - 1)] } },
+		{ bad: { p: "codex", r: [null] } },
+	]) {
+		writeJson(cache, { models: ["gpt-6.1-sol"], files });
+		const usage = scanUsageTelemetry(home, now);
+		const result = resolveModels(config, undefined, null, { usage });
+		const report = formatUsageReport({ usage }, result);
+		assert.match(report, /Google API token-price scenario: unavailable \(token usage incomplete\)/);
+		assert.ok(!/Google API token-price scenario: ~\$/.test(report));
+	}
+	writeJson(cache, { models: ["gpt-6.1-sol"], files: { old: { p: "unknown", r: [row(now - 8 * 86400000)] }, good: { p: "codex", r: [row(now - 1)] } } });
+	const usage = scanUsageTelemetry(home, now);
+	assert.ok(usage.byProvider.codex.unknownCost);
+	assert.ok(!usage.byProvider.codex.unknownCost7d);
+	assert.ok(resolveModels(config, undefined, ["codex"], { usage }, { weeklyLimits: { codex: 5 } }).models.length > 0);
+});
