@@ -75,6 +75,8 @@ In T3, verify live `orchestrator_capabilities`, pass options in `delegate_task.t
 
 The model list defaults to direct Codex/Claude plus OpenCode GLM 5.3 and DeepSeek V4 patterns; Fable/legacy models are excluded. Direct subscriptions rank before paid gateways, and OpenCode `openai/*` / `anthropic/*` are blocked to avoid accidental duplicate API billing. Disabled providers, hidden models, and unavailable gateways are respected. Cross-family review is a preference within the permitted pool.
 
+GPT-6.1 Terra is included by the existing `codex:all` default as an `@fast` specialist for visual reasoning, browser/desktop tasks, concise writing, and scoped code fixes. Sol remains the coding coordinator; Luna remains the cheaper routine recon choice. Terra's standard API-equivalent prices are $1 input / $5 output / $0.05 cached input per million tokens, not a subscription quota estimate. See [OpenAI model guidance](https://developers.openai.com/api/docs/guides/model-selection) and [Terra specifications](https://developers.openai.com/api/docs/models/gpt-6.1-terra). Codex CLI requires 0.159.0 or later; live availability and reasoning options still come from the host catalog.
+
 ## Commands
 
 Standalone Codex must pass `--harness codex`; standalone Claude must pass `--harness claude`. T3 supports cross-provider routing unless the user restricts it. Never infer the host solely from the coordinator model.

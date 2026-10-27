@@ -18,6 +18,7 @@ test("default model.json resolves expected models and excludes claude-fable and 
 	const ids = resolved.models.map((m) => m.id);
 	assert.ok(ids.includes("gpt-6-astra"), "includes gpt-6-astra");
 	assert.ok(ids.includes("gpt-6.1-sol"), "includes gpt-6.1-sol");
+	assert.ok(ids.includes("gpt-6.1-terra"), "includes gpt-6.1-terra via codex:all");
 	assert.ok(ids.includes("gpt-6-luna"), "includes gpt-6-luna");
 	assert.ok(ids.includes("claude-opus-5-5"), "includes claude-opus-5-5");
 	assert.ok(ids.includes("claude-sonnet-5-5"), "includes claude-sonnet-5-5");
@@ -33,6 +34,21 @@ test("default model.json resolves expected models and excludes claude-fable and 
 	assert.ok(!ids.includes("opencode/kimi-k3"), "excludes Kimi by default");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813"), "includes DeepSeek Pro by default");
 	assert.ok(ids.includes("cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"), "includes DeepSeek Flash by default");
+});
+
+test("Terra is a fast specialist without replacing Sol coordination or Luna recon", () => {
+	const resolved = resolveModels(defaultConfig);
+	const terra = resolved.tiers.fast.find((m) => m.id === "gpt-6.1-terra");
+	assert.ok(terra);
+	assert.deepEqual(terra.cost, { input: 1, output: 5, cacheRead: 0.05 });
+	assert.equal(terra.billing, "subscription");
+	assert.deepEqual(terra.options, { reasoningEffort: "medium", serviceTier: "default" });
+	assert.equal(resolved.recommended.coordinator.id, "gpt-6.1-sol");
+	assert.equal(resolved.recommended.primaryImplementer.id, "gpt-6.1-sol");
+	assert.equal(resolved.recommended.fastRecon.id, "gpt-6-luna");
+	assert.ok(!resolved.models.some((m) => m.id === "gpt-5.6-terra"));
+	const unavailable = resolveModels(defaultConfig, [{ providerInstanceId: "codex", id: "gpt-6.1-sol" }]);
+	assert.ok(!unavailable.models.some((m) => m.id === "gpt-6.1-terra"));
 });
 
 test("DeepSeek v4 wildcard includes minor versions and provider-prefixed IDs", () => {
