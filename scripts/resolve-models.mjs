@@ -924,7 +924,7 @@ export function formatMarkdown(resolved) {
 	lines.push("### Recommended Cost-Optimized Routing");
 	if (resolved.recommended.coordinator) {
 		const c = resolved.recommended.coordinator;
-		lines.push(`- **Coordinator (Main Thread):** \`${c.providerInstanceId}:${c.id}\` (\`${c.reasoning}\`, \`${c.billing}\`)`);
+		lines.push(`- **Default Coordinator (New Threads):** \`${c.providerInstanceId}:${c.id}\` (\`${c.reasoning}\`, \`${c.billing}\`)`);
 	}
 	if (resolved.recommended.fastRecon) {
 		const f = resolved.recommended.fastRecon;

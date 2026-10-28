@@ -41,7 +41,7 @@ Configuration loads bundled `model.json` defaults and merges one personal overri
 2. **Subscription vs API Protection:**
    - Direct `codex` (OpenAI subscription) and `claudeAgent` (Anthropic subscription) are always prioritized over paid API gateways.
    - `blockApiSubproviders: ["openai", "anthropic"]` blocks OpenCode's `openai/*` and `anthropic/*` API keys so Claude/OpenAI models never accidentally bill per-token over OpenCode.
-3. **Recommended Default Coordinator: Subscription `@workhorse` (`gpt-6.1-sol` or `claude-sonnet-5-5`).** Preserve an explicitly chosen coordinator, including Astra; the router never switches a running main thread. The coordinator model is neither a floor nor a ceiling for worker tiers.
+3. **Recommended Default Coordinator for New Threads: Subscription `@workhorse` (`gpt-6.1-sol` or `claude-sonnet-5-5`).** Preserve the running coordinator, including Astra. Resolver coordinator recommendations are starting-model advice; do not replace the current coordinator based on cost or headroom. The coordinator model is neither a floor nor a ceiling for worker tiers.
    - A coordinator executes 40–100+ tool turns per task (~1B cached tokens/week across tasks).
    - `gpt-6-astra` burns **$1.00/M cached input** ($10/$50 in/out), whereas `gpt-6.1-sol` and `claude-sonnet-5-5` burn **$0.10/M cached input** ($2/$10 in/out) — lower API-equivalent cost over a full task lifecycle. API prices do not establish subscription quota multipliers.
    - Running 1B cached tokens/week on a pay-per-token API (such as `google/gemini-4-argon` at $0.10/M cache) would bill **~$160/week (~$700/month)** in cash, whereas flat-rate subscriptions (`codex` + `claudeAgent`) absorb high-turn coordinator cache reads at fixed monthly cost.
