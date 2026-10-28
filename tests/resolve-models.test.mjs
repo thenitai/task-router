@@ -456,3 +456,75 @@ test("personal configuration merges defaults and respects path precedence", (t) 
 	fs.writeFileSync(path.join(home, candidates[0]), "{broken");
 	assert.throws(() => loadConfig(null, home), /Cannot load configuration/);
 });
+
+test("frontier implementation recommendation preserves ranked eligibility and explicit effort/options", () => {
+	for (const budgetMode of ["balanced", "economy", "performance"]) {
+		for (const [harness, id, options] of [
+			["codex", "gpt-6-astra", { reasoningEffort: "xhigh", serviceTier: "default" }],
+			["claudeAgent", "claude-opus-5-5", { effort: "xhigh", fastMode: false }],
+		]) {
+			const result = resolveModels({ ...defaultConfig, reasoning: { ...defaultConfig.reasoning, frontier: "xhigh" } }, undefined, [harness], null, { budgetMode });
+			assert.deepEqual(result.recommended.frontierImplementer, result.tiers.frontier[0]);
+			assert.equal(result.recommended.frontierImplementer.id, id);
+			assert.deepEqual(result.recommended.frontierImplementer.options, options);
+			assert.equal(result.recommended.frontierImplementer.reasoning, "xhigh");
+			const row = formatMarkdown(result).split("\n").find((line) => line.includes("Hard / High-Risk Implementation"));
+			assert.ok(row.includes(id));
+			assert.ok(row.includes(JSON.stringify(options)));
+			assert.deepEqual(JSON.parse(JSON.stringify(result)).recommended.frontierImplementer, result.recommended.frontierImplementer);
+		}
+	}
+	const legacy = resolveModels({ select: ["codex:all"] });
+	assert.equal(legacy.recommended.coordinator.id, "gpt-6.1-sol");
+	assert.equal(legacy.recommended.primaryImplementer.id, "gpt-6.1-sol");
+	assert.equal(legacy.recommended.crossFamilyReviewer.id, "gpt-6-astra");
+	assert.equal(legacy.recommended.fastRecon.id, "gpt-6-luna");
+});
+
+test("frontier recommendation stays null without eligible frontier, including blocked and disabled pools", () => {
+	for (const runtime of [{ disabledProviders: new Set(["codex"]) }, { providerBlocks: { codex: null } }]) {
+		assert.equal(resolveModels(defaultConfig, undefined, ["codex"], runtime).recommended.frontierImplementer, null);
+	}
+	for (const cfg of [{ ...defaultConfig, models: ["codex:gpt-6.1-sol"] }, { ...defaultConfig, plans: { openai: 0 } }]) {
+		const result = resolveModels(cfg, undefined, ["codex"]);
+		assert.equal(result.recommended.frontierImplementer, null);
+		assert.ok(!formatMarkdown(result).includes("Hard / High-Risk Implementation"));
+	}
+	const capped = resolveModels(defaultConfig, undefined, ["codex"], { usage: { byProvider: { codex: { usd7d: 10 } } } }, { weeklyLimits: { codex: 5 } });
+	assert.equal(capped.recommended.frontierImplementer, null);
+	assert.equal(resolveModels(defaultConfig, []).recommended.frontierImplementer, null);
+});
+
+test("parent metadata and catalog ordering impose no worker-tier floor or ceiling", async () => {
+	const { catalogFromCapabilities } = await import("../scripts/resolve-models.mjs");
+	const models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"].map((id) => ({ id, options: [
+		{ id: "reasoningEffort", values: ["low", "medium", "high"] },
+		{ id: "serviceTier", values: ["default", "priority"] },
+	] }));
+	let baseline;
+	for (const inheritedModel of ["gpt-6.1-sol", "gpt-6-astra"]) {
+		for (const reasoningEffort of ["low", "high"]) {
+			for (const ordered of [models, [...models].reverse()]) {
+				const catalog = catalogFromCapabilities({ inheritedModel, inheritedOptions: { reasoningEffort, serviceTier: "priority" }, providers: [{ providerInstanceId: "codex", canRunChildTask: true, models: ordered }] });
+				const result = resolveModels(defaultConfig, catalog, ["codex"]);
+				baseline ??= result.recommended;
+				assert.deepEqual(result.recommended, baseline);
+				assert.equal(result.budget.mode, "balanced");
+				assert.equal(result.recommended.frontierImplementer.id, "gpt-6-astra");
+				assert.equal(result.recommended.fastRecon.id, "gpt-6-luna");
+			}
+		}
+	}
+});
+
+
+test("CLI JSON and Markdown expose frontier implementation without changing legacy recommendations", () => {
+	const script = path.join(__dirname, "..", "scripts", "resolve-models.mjs");
+	const args = [script, "--static", "--config", path.join(__dirname, "..", "model.json"), "--harness", "codex"];
+	const json = JSON.parse(execFileSync(process.execPath, [...args, "--json"], { encoding: "utf8" }));
+	assert.equal(json.recommended.frontierImplementer.id, "gpt-6-astra");
+	assert.equal(json.recommended.primaryImplementer.id, "gpt-6.1-sol");
+	assert.equal(execFileSync(process.execPath, args, { encoding: "utf8" }).trim(), formatMarkdown(json));
+	const fast = resolveModels({ ...defaultConfig, speed: "fast" }, undefined, ["codex"]);
+	assert.deepEqual(fast.recommended.frontierImplementer.options, { reasoningEffort: "high", serviceTier: "priority" });
+});

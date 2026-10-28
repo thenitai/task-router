@@ -41,7 +41,7 @@ Configuration loads bundled `model.json` defaults and merges one personal overri
 2. **Subscription vs API Protection:**
    - Direct `codex` (OpenAI subscription) and `claudeAgent` (Anthropic subscription) are always prioritized over paid API gateways.
    - `blockApiSubproviders: ["openai", "anthropic"]` blocks OpenCode's `openai/*` and `anthropic/*` API keys so Claude/OpenAI models never accidentally bill per-token over OpenCode.
-3. **Why the Coordinator Must Be a Subscription `@workhorse` (`gpt-6.1-sol` or `claude-sonnet-5-5`), Not `gpt-6-astra` or a Pay-Per-Token API:**
+3. **Recommended Default Coordinator: Subscription `@workhorse` (`gpt-6.1-sol` or `claude-sonnet-5-5`).** Preserve an explicitly chosen coordinator, including Astra; the router never switches a running main thread. The coordinator model is neither a floor nor a ceiling for worker tiers.
    - A coordinator executes 40–100+ tool turns per task (~1B cached tokens/week across tasks).
    - `gpt-6-astra` burns **$1.00/M cached input** ($10/$50 in/out), whereas `gpt-6.1-sol` and `claude-sonnet-5-5` burn **$0.10/M cached input** ($2/$10 in/out) — lower API-equivalent cost over a full task lifecycle. API prices do not establish subscription quota multipliers.
    - Running 1B cached tokens/week on a pay-per-token API (such as `google/gemini-4-argon` at $0.10/M cache) would bill **~$160/week (~$700/month)** in cash, whereas flat-rate subscriptions (`codex` + `claudeAgent`) absorb high-turn coordinator cache reads at fixed monthly cost.
@@ -53,9 +53,9 @@ Configuration loads bundled `model.json` defaults and merges one personal overri
 | `@fast` | `codex:gpt-6-luna`, `claudeAgent:claude-haiku-5-5`, `cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash`, `cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731`, `opencode/gemini-3.8-flash` | **$0.10–$0.44** / $0.50–$1.32 / **$0.01–$0.03** | First choice for read-only recon, file/doc/config checks, log scanning, and simple mechanical edits. |
 | `@fast` (Visual / Writing Specialist) | `codex:gpt-6.1-terra` | **$1.00** / $5.00 / **$0.05** | Visual reasoning, screenshot checks, precise browser/desktop tasks, concise writing, and scoped code fixes with clear acceptance checks. Keep Sol/Sonnet for complex coding and coordination; Luna remains cheaper for routine recon. |
 | `@workhorse` (Budget / Open-Weight) | `cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813`, `cloudflare-workers-ai/@cf/zai-org/glm-5.3` | **$1.32–$1.40** / $3.96–$4.40 / **$0.044–$0.26** | Unit tests, boilerplate, data transforms, and secondary implementation slices to preserve OpenAI/Claude subscription quota. |
-| `@workhorse` (Subscription) | `codex:gpt-6.1-sol`, `claudeAgent:claude-sonnet-5-5` | **$2.00** / $10.00 / **$0.10** | Coordinator, primary feature/UI/Pug/SPA DOM implementation, browser testing (`NadaMini`), and final git integration. |
-| `@frontier` | `claudeAgent:claude-opus-5-5` ($4/$20/$0.20), `codex:gpt-6-astra` ($10/$50/$1.00), `opencode:google/gemini-4-argon` ($2/$10/$0.10) | **$2.00–$10.00** / $10–$50 / **$0.10–$1.00** | Bounded complex backend/security/concurrency slices and adversarial code review. |
-| `@reviewer` | Independent `@frontier` or `@workhorse` at `high` reasoning | Bounded 1–3 turn review | Independent correctness and acceptance-criteria review within the allowed pool; prefer a different family only when available. |
+| `@workhorse` (Subscription) | `codex:gpt-6.1-sol`, `claudeAgent:claude-sonnet-5-5` | **$2.00** / $10.00 / **$0.10** | Default coordinator and substantial normal implementation, testing, and integration. |
+| `@frontier` | `claudeAgent:claude-opus-5-5` ($4/$20/$0.20), `codex:gpt-6-astra` ($10/$50/$1.00), `opencode:google/gemini-4-argon` ($2/$10/$0.10) | **$2.00–$10.00** / $10–$50 / **$0.10–$1.00** | Genuinely hard or high-risk implementation and review; choose directly when warranted. |
+| `@reviewer` | Independent model and effort matched to assignment risk | Bounded 1–3 turn review | Independent correctness and acceptance-criteria review within the allowed pool; prefer a different family only when available. |
 
 ---
 
@@ -83,9 +83,9 @@ Ask for the user's approval and **STOP**. Wait for explicit approval in a later 
 Proceed autonomously through the approved implementation and completion workflow in `AGENTS.md`, including worktree setup, review, testing, integration into `develop`, push, and cleanup.
 
 Remain the coordinator. Assign every role only from the restricted resolved pool; the model examples below apply only when included in that pool:
-- Offload narrow exploration/doc checks to `@fast` (`gpt-6-luna`, `claude-haiku-5-5`, `glm-5.3-flash`, `deepseek-v4-flash`) and boilerplate/test slices to budget `@workhorse` (`deepseek-v4-pro`, `glm-5.3`).
-- Use subscription `@workhorse` (`gpt-6.1-sol` or `claude-sonnet-5-5`, automatically preferring whichever subscription has more remaining headroom) for core implementation, UI/Pug/SPA incremental DOM updates, browser testing on `NadaMini`, and final integration.
-- Reserve `@frontier` (`claude-opus-5-5`, `gpt-6-astra`, or `google/gemini-4-argon`) for bounded hard slices and independent `@reviewer` (`high` reasoning).
+- For every assignment, including reviews, assess scope, uncertainty, and consequences before selecting both model and effort; give a brief reason. Do not infer difficulty or budget mode from the parent model, inherited effort, or provider. Frontend and docs are examples, never fixed routing categories.
+- Use economical capable agents for clear bounded work, `@workhorse` for substantial normal implementation, and `@frontier` directly for genuinely hard or high-risk work, even from Sol/Sonnet. Use the existing tier lists and dispatch options. `recommended.frontierImplementer` exposes the highest-ranked eligible frontier implementation candidate; it is null when none qualifies, never a cheaper substitute labeled frontier. Other recommendations remain defaults, not assignment mandates.
+- Match reviewer capability and effort to the assignment's risk. Keep review independent of the actual implementer and prefer a different family within the allowed pool; never assume the coordinator's family is the implementer's. Re-select from the tier lists after choosing the implementer: the general reviewer recommendation is relative to the default primary implementer. A trivial change does not automatically need Astra/Opus or high effort.
 - Allow at most **five concurrent subagents**. Assign distinct file ownership and run dependent steps in order.
 - Give every agent a **self-contained brief** with:
   1. Enumerated requirements and settled decisions.
@@ -93,6 +93,10 @@ Remain the coordinator. Assign every role only from the restricted resolved pool
   3. Absolute path of its own worktree and the coordinator commit it starts from.
   4. Bounded file ownership, acceptance criteria, and validation duties.
 - Explicitly set model, reasoning, and speed options on every call. Use the resolved `options` as T3 `target.options` after checking `orchestrator_capabilities`; unsupported options are a configuration mismatch, not permission to silently substitute.
+
+### Evidence-Based Escalation
+
+Worker choices and promotions within approved scope and budget are automatic; no fresh permission is needed for each assignment. Choose frontier immediately for obviously hard work. When a bounded lower-tier attempt reveals a capability gap, inspect its result, stop/cancel the old worker if active, preserve partial work, recheck eligibility, and hand only the unfinished slice to a capable agent with the evidence and remaining checks. Ordinary code, test, or infrastructure failures alone do not prove a stronger model is needed. Avoid endless retries and duplicate active workers. If required capability is unavailable, report the blocker rather than silently weakening the assignment. Scope or spending increases still require approval; never expand providers or enable hidden paid overage.
 
 ### Limits and Provider Failover
 

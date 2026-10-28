@@ -33,7 +33,7 @@ export function planToWeeklyLimitUsd(providerInstanceId, monthlyPlanUsd) {
 }
 
 export const CANONICAL_MODELS = [
-	{ providerInstanceId: "codex", id: "gpt-6-astra", label: "GPT-6-Astra", family: "openai", billing: "subscription", cost: { input: 10, output: 50, cacheRead: 1 }, tiers: ["frontier"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Heavy frontier (10x cache burn vs Sol) — reserve for bounded hard slices/review, avoid as coordinator" },
+	{ providerInstanceId: "codex", id: "gpt-6-astra", label: "GPT-6-Astra", family: "openai", billing: "subscription", cost: { input: 10, output: 50, cacheRead: 1 }, tiers: ["frontier"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Heavy frontier (10x cache burn vs Sol) — reserve for bounded hard slices/review, costlier than the default workhorse coordinator" },
 	{ providerInstanceId: "codex", id: "gpt-6.1-sol", label: "GPT-6.1-Sol", family: "openai", billing: "subscription", cost: { input: 2, output: 10, cacheRead: 0.1 }, tiers: ["workhorse", "long_context"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Primary subscription workhorse (500k context, $0.10/M cache read) — ideal Coordinator & Integrator" },
 	{ providerInstanceId: "codex", id: "gpt-6.1-terra", label: "GPT-6.1-Terra", family: "openai", billing: "subscription", cost: { input: 1, output: 5, cacheRead: 0.05 }, tiers: ["fast"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max", "ultra"], notes: "Visual reasoning, precise browser/desktop work, concise writing, and scoped code fixes — keep Sol for complex coding and coordination; API-equivalent prices do not establish subscription quota" },
 	{ providerInstanceId: "codex", id: "gpt-6-luna", label: "GPT-6-Luna", family: "openai", billing: "subscription", cost: { input: 0.1, output: 0.5, cacheRead: 0.01 }, tiers: ["fast"], generation: "current", reasoningOptions: ["low", "medium", "high", "xhigh", "max"], notes: "Ultra-low quota burn ($0.01/M cache read) — fast recon, search, and doc/config checks" },
@@ -866,6 +866,7 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 		recommended: {
 			coordinator,
 			primaryImplementer: primaryImpl,
+			frontierImplementer: tiers.frontier[0] || null,
 			secondaryImplementer: secondarySubImpl,
 			budgetImplementer: budgetImpl,
 			crossFamilyReviewer: reviewer,
@@ -936,6 +937,10 @@ export function formatMarkdown(resolved) {
 	if (resolved.recommended.primaryImplementer) {
 		const impl = resolved.recommended.primaryImplementer;
 		lines.push(`- **Primary Feature / UI / Integration (\`@workhorse\`):** \`${impl.providerInstanceId}:${impl.id}\` (\`${impl.reasoning}\`, \`${impl.billing}\`)`);
+	}
+	if (resolved.recommended.frontierImplementer) {
+		const impl = resolved.recommended.frontierImplementer;
+		lines.push(`- **Hard / High-Risk Implementation (\`@frontier\`):** \`${impl.providerInstanceId}:${impl.id}\` (\`${impl.reasoning}\`, \`${impl.billing}\`, options: \`${JSON.stringify(impl.options)}\`)`);
 	}
 	if (resolved.recommended.secondaryImplementer) {
 		const sec = resolved.recommended.secondaryImplementer;
