@@ -466,6 +466,7 @@ test("frontier implementation recommendation preserves ranked eligibility and ex
 			const result = resolveModels({ ...defaultConfig, reasoning: { ...defaultConfig.reasoning, frontier: "xhigh" } }, undefined, [harness], null, { budgetMode });
 			assert.deepEqual(result.recommended.frontierImplementer, result.tiers.frontier[0]);
 			assert.equal(result.recommended.frontierImplementer.id, id);
+			assert.equal(result.recommended.coordinator.id, budgetMode === "performance" ? id : harness === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5-5");
 			assert.deepEqual(result.recommended.frontierImplementer.options, options);
 			assert.equal(result.recommended.frontierImplementer.reasoning, "xhigh");
 			const row = formatMarkdown(result).split("\n").find((line) => line.includes("Hard / High-Risk Implementation"));

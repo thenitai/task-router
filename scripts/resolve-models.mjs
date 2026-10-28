@@ -948,7 +948,7 @@ export function formatMarkdown(resolved) {
 	}
 	if (resolved.recommended.crossFamilyReviewer) {
 		const rev = resolved.recommended.crossFamilyReviewer;
-		lines.push(`- **Independent Reviewer (\`@reviewer\`):** \`${rev.providerInstanceId}:${rev.id}\` (\`${rev.reasoning}\`, family: \`${rev.family}\`)`);
+		lines.push(`- **Reviewer for Default Primary Implementer; Reselect if Changed (\`@reviewer\`):** \`${rev.providerInstanceId}:${rev.id}\` (\`${rev.reasoning}\`, family: \`${rev.family}\`)`);
 	}
 	return lines.join("\n");
 }
