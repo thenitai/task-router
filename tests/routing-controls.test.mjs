@@ -72,6 +72,24 @@ test("Cloudflare cash budget preserves zero, unknown and gateway separation", ()
 	assert.throws(() => resolveModels(cfg), /non-negative/);
 });
 
+test("Anthropic API budget caps OpenCode anthropic/* without touching the Claude subscription", () => {
+	const catalog = [
+		{ providerInstanceId: "claudeAgent", id: "claude-sonnet-5-5", label: "Sonnet", billing: "subscription", reasoningOptions: ["medium"] },
+		{ providerInstanceId: "opencode", id: "anthropic/claude-sonnet-5-5", label: "Sonnet API", billing: "api", reasoningOptions: ["medium"] },
+	];
+	const cfg = { ...config, budget: { ...config.budget, blockApiSubproviders: [] }, models: ["claude:all", "opencode:anthropic/*"], apiBudgets: { anthropic: { monthlyUsd: 100 } } };
+	const runtime = { usage: { apiSpending: { anthropic: { complete: true, spentUsd: 40 } } } };
+	let result = resolveModels(cfg, catalog, ["opencode"], runtime);
+	assert.equal(result.apiBudgetStatus.anthropic.blocked, false);
+	assert.ok(result.models.some((m) => m.id === "anthropic/claude-sonnet-5-5"));
+	runtime.usage.apiSpending.anthropic.spentUsd = 100;
+	result = resolveModels(cfg, catalog, null, runtime);
+	assert.equal(result.apiBudgetStatus.anthropic.reason, "monthly budget reached");
+	assert.ok(!result.models.some((m) => m.id.startsWith("anthropic/")));
+	assert.ok(result.models.some((m) => m.id === "claude-sonnet-5-5"), "subscription stays available");
+	assert.throws(() => resolveModels({ ...cfg, apiBudgets: { openai: { monthlyUsd: 1 } } }, catalog), /Unknown apiBudgets provider: openai/);
+});
+
 test("speed settings produce explicit role-specific dispatch options", () => {
 	for (const speed of ["standard", "fast"]) {
 		const result = resolveModels({ ...config, speed });
@@ -187,6 +205,7 @@ test("OpenCode calendar-month spending isolates Cloudflare and flags missing cos
 	let usage = scanUsageTelemetry(home, now);
 	assert.equal(usage.apiSpending.cloudflare.spentUsd, 3);
 	assert.equal(usage.apiSpending.cloudflare.complete, true);
+	assert.equal(usage.apiSpending.anthropic.spentUsd, 0);
 	execFileSync("sqlite3", [db, insert({ ...messages[0], cost: undefined })]);
 	usage = scanUsageTelemetry(home, now);
 	assert.equal(usage.apiSpending.cloudflare.complete, false);

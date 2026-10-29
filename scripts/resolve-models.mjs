@@ -19,6 +19,9 @@ const PROVIDER_ALIASES = {
 	google: "opencode",
 };
 
+// Metered OpenCode subproviders that accept apiBudgets.<key>.monthlyUsd, keyed to their model-ID prefix.
+export const API_BUDGET_PREFIXES = { cloudflare: "cloudflare-workers-ai/", anthropic: "anthropic/" };
+
 export const PLAN_WEEKLY_CAPACITY_USD = {
 	codex: { 20: 175, 200: 1750 },
 	claudeAgent: { 20: 90, 100: 450, 200: 1500 },
@@ -423,7 +426,7 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 			const rawRows = execFileSync("sqlite3", ["-readonly", "-json", ocDbPath, sql], { encoding: "utf8", timeout: 3000 }).trim();
 			const rows = rawRows ? JSON.parse(rawRows) : [];
 			byProvider.opencode ??= { usd7d: 0, tokens7d: 0, unknownCost7d: 0, unknownTokens7d: 0 };
-			apiSpending.cloudflare = { monthStart: new Date(monthStartMs).toISOString(), spentUsd: 0, complete: true, sourceFile: ocDbPath };
+			for (const key of Object.keys(API_BUDGET_PREFIXES)) apiSpending[key] = { monthStart: new Date(monthStartMs).toISOString(), spentUsd: 0, complete: true, sourceFile: ocDbPath };
 			for (const { model, monthUsd, monthIncomplete, ...totals } of rows) {
 				for (const [unit, flag] of [["usd", "unknownCost"], ["tokens", "unknownTokens"]]) {
 					if (!Number.isFinite(totals[`${unit}Total`])) totals[flag] = 1;
@@ -439,10 +442,12 @@ export function scanUsageTelemetry(homeDir = os.homedir(), nowMs = Date.now()) {
 					}
 					byProvider[prov][key] = (byProvider[prov][key] || 0) + value;
 				}
-				if (model.startsWith("unknown/") && (monthIncomplete || !Number.isFinite(monthUsd) || monthUsd > 0)) apiSpending.cloudflare.complete = false;
-				if (model.startsWith("cloudflare-workers-ai/")) {
-					if (Number.isFinite(monthUsd)) apiSpending.cloudflare.spentUsd += monthUsd;
-					if (monthIncomplete || !Number.isFinite(monthUsd) || !Number.isFinite(apiSpending.cloudflare.spentUsd)) apiSpending.cloudflare.complete = false;
+				for (const [key, prefix] of Object.entries(API_BUDGET_PREFIXES)) {
+					const spending = apiSpending[key];
+					if (model.startsWith("unknown/") && (monthIncomplete || !Number.isFinite(monthUsd) || monthUsd > 0)) spending.complete = false;
+					if (!model.startsWith(prefix)) continue;
+					if (Number.isFinite(monthUsd)) spending.spentUsd += monthUsd;
+					if (monthIncomplete || !Number.isFinite(monthUsd) || !Number.isFinite(spending.spentUsd)) spending.complete = false;
 				}
 			}
 		} catch { warnings.push("OpenCode spending unavailable: cannot read local database"); }
@@ -736,24 +741,24 @@ export function resolveModels(config, catalogModels = CANONICAL_MODELS, activeHa
 	if (config?.apiBudgets !== undefined) {
 		const budgets = config.apiBudgets;
 		if (budgets === null || typeof budgets !== "object" || Array.isArray(budgets)) throw new Error("apiBudgets must be an object mapping providers to budgets");
-		if (Object.keys(budgets).some((key) => key !== "cloudflare")) throw new Error("Unknown apiBudgets provider: only cloudflare is supported");
-	}
-	if (config?.apiBudgets?.cloudflare !== undefined) {
-		const budget = config.apiBudgets.cloudflare;
-		if (budget === null || typeof budget !== "object" || Array.isArray(budget) || Object.keys(budget).some((key) => key !== "monthlyUsd")) throw new Error("apiBudgets.cloudflare must be an object containing monthlyUsd");
-		const monthlyUsd = config.apiBudgets.cloudflare.monthlyUsd;
-		if (typeof monthlyUsd !== "number" || !Number.isFinite(monthlyUsd) || monthlyUsd < 0) throw new Error("apiBudgets.cloudflare.monthlyUsd must be a non-negative number");
-		const spending = runtimeState?.usage?.apiSpending?.cloudflare;
-		const complete = spending?.complete === true && Number.isFinite(spending?.spentUsd) && spending.spentUsd >= 0;
-		const blocked = monthlyUsd === 0 || !complete || spending.spentUsd >= monthlyUsd;
-		apiBudgetStatus.cloudflare = { monthlyUsd, spentUsd: complete ? spending.spentUsd : null, knownSpendUsd: spending?.spentUsd ?? null, blocked, sourceFile: spending?.sourceFile ?? null,
-			reason: monthlyUsd === 0 ? "zero budget" : !complete ? "spending unknown or incomplete" : blocked ? "monthly budget reached" : null };
-		if (blocked) blockedProviders.add("cloudflare");
+		const unknown = Object.keys(budgets).find((key) => !API_BUDGET_PREFIXES[key]);
+		if (unknown) throw new Error(`Unknown apiBudgets provider: ${unknown} (supported: ${Object.keys(API_BUDGET_PREFIXES).join(", ")})`);
+		for (const [key, budget] of Object.entries(budgets)) {
+			if (budget === null || typeof budget !== "object" || Array.isArray(budget) || Object.keys(budget).some((field) => field !== "monthlyUsd")) throw new Error(`apiBudgets.${key} must be an object containing monthlyUsd`);
+			const monthlyUsd = budget.monthlyUsd;
+			if (typeof monthlyUsd !== "number" || !Number.isFinite(monthlyUsd) || monthlyUsd < 0) throw new Error(`apiBudgets.${key}.monthlyUsd must be a non-negative number`);
+			const spending = runtimeState?.usage?.apiSpending?.[key];
+			const complete = spending?.complete === true && Number.isFinite(spending?.spentUsd) && spending.spentUsd >= 0;
+			const blocked = monthlyUsd === 0 || !complete || spending.spentUsd >= monthlyUsd;
+			apiBudgetStatus[key] = { monthlyUsd, spentUsd: complete ? spending.spentUsd : null, knownSpendUsd: spending?.spentUsd ?? null, blocked, sourceFile: spending?.sourceFile ?? null,
+				reason: monthlyUsd === 0 ? "zero budget" : !complete ? "spending unknown or incomplete" : blocked ? "monthly budget reached" : null };
+			if (blocked) blockedProviders.add(key);
+		}
 	}
 
 	const filtered = enriched.filter((model) => {
 		if (blockedProviders.has(model.providerInstanceId)) return false;
-		if (model.providerInstanceId === "opencode" && model.id.startsWith("cloudflare-workers-ai/") && blockedProviders.has("cloudflare")) return false;
+		if (model.providerInstanceId === "opencode" && Object.entries(API_BUDGET_PREFIXES).some(([key, prefix]) => model.id.startsWith(prefix) && blockedProviders.has(key))) return false;
 		if (model.billing === "subscription" && plans[model.providerInstanceId] === 0) return false;
 		if (activeHarnesses && !activeHarnesses.includes(model.providerInstanceId)) return false;
 		if (model.providerInstanceId === "opencode" && model.id.includes("/")) {
