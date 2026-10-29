@@ -99,6 +99,11 @@ test("Claude live quota handles current windows, auth errors and unavailable cre
 	assert.match(failed.error, /HTTP 401/);
 	assert.ok(!JSON.stringify(failed).includes("fixture-token"));
 	assert.ok((await readClaudeQuota(home, async () => { throw new Error("fixture-token"); }, now)).error);
+	const limited = await readClaudeQuota(home, async () => ({ ok: false, status: 429 }), now + 30_000);
+	assert.equal(limited.usedPercent, 23, "429 reuses the last reading");
+	assert.equal(limited.eventTsMs, now, "reused reading keeps its original observed time");
+	writeJson(path.join(home, ".config", "task-router", "claude-quota.json"), { ...limited, eventTsMs: now - 16 * 60_000 });
+	assert.match((await readClaudeQuota(home, async () => ({ ok: false, status: 429 }), now)).error, /HTTP 429/, "stale reading is not reused");
 	fs.unlinkSync(path.join(home, ".claude", ".credentials.json"));
 	assert.ok((await readClaudeQuota(home)).error);
 });
