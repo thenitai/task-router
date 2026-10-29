@@ -1058,7 +1058,8 @@ function parseLimitsArg(raw, flag) {
 	return out;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// realpath: the skill is often invoked through a symlinked directory (~/.claude/skills).
+if (process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1])) {
 	const args = process.argv.slice(2);
 	const configIdx = args.indexOf("--config");
 	const catalogIdx = args.indexOf("--catalog");

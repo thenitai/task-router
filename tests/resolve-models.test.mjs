@@ -529,3 +529,10 @@ test("CLI JSON and Markdown expose frontier implementation without changing lega
 	const fast = resolveModels({ ...defaultConfig, speed: "fast" }, undefined, ["codex"]);
 	assert.deepEqual(fast.recommended.frontierImplementer.options, { reasoningEffort: "high", serviceTier: "priority" });
 });
+
+test("runs when invoked through a symlinked skill directory", () => {
+	const link = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tr-link-")), "task-router");
+	fs.symlinkSync(path.join(__dirname, ".."), link);
+	const out = execFileSync(process.execPath, [path.join(link, "scripts", "resolve-models.mjs"), "--static", "--json"], { encoding: "utf8" });
+	assert.ok(JSON.parse(out).models, "symlinked invocation must still print output");
+});
