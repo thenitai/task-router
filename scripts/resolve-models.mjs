@@ -64,6 +64,12 @@ export function normalizeProvider(raw) {
 	return PROVIDER_ALIASES[key] || raw;
 }
 
+// Metered API keys (e.g. "anthropic") block their OpenCode subprovider, never the subscription they would alias to.
+export function normalizeBlockProvider(raw) {
+	const key = String(raw || "").trim().toLowerCase();
+	return API_BUDGET_PREFIXES[key] ? key : normalizeProvider(raw);
+}
+
 export function globToRegExp(pattern) {
 	const escaped = String(pattern).trim().replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
 	return new RegExp(`^${escaped}$`, "i");
@@ -1091,12 +1097,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(proces
 		const raw = args[blockIdx + 1];
 		if (!raw || raw.startsWith("--")) throw new Error("--block requires provider[=future-ISO-reset]");
 		const split = raw.indexOf("=");
-		recordProviderBlock(normalizeProvider(split < 0 ? raw : raw.slice(0, split)), split < 0 ? null : raw.slice(split + 1));
+		recordProviderBlock(normalizeBlockProvider(split < 0 ? raw : raw.slice(0, split)), split < 0 ? null : raw.slice(split + 1));
 	}
 	if (unblockIdx !== -1) {
 		const raw = args[unblockIdx + 1];
 		if (!raw || raw.startsWith("--")) throw new Error("--unblock requires a provider");
-		clearProviderBlock(normalizeProvider(raw));
+		clearProviderBlock(normalizeBlockProvider(raw));
 	}
 	const runtimeState = staticOnly ? null : discoverRuntimeState();
 	if (runtimeState && effectivePlans.claudeAgent > 0 && !runtimeState.disabledProviders.has("claudeAgent")

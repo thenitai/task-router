@@ -5,7 +5,7 @@ import os from "node:os";
 import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { readClaudeQuota, readProviderBlocks, recordProviderBlock, clearProviderBlock } from "../scripts/provider-quota.mjs";
-import { resolveModels, scanUsageTelemetry, findLatestCodexRateLimits, formatUsageReport, formatMarkdown } from "../scripts/resolve-models.mjs";
+import { resolveModels, normalizeBlockProvider, scanUsageTelemetry, findLatestCodexRateLimits, formatUsageReport, formatMarkdown } from "../scripts/resolve-models.mjs";
 
 const config = JSON.parse(fs.readFileSync(new URL("../model.json", import.meta.url), "utf8"));
 const tempHome = (t) => {
@@ -88,6 +88,22 @@ test("Anthropic API budget caps OpenCode anthropic/* without touching the Claude
 	assert.ok(!result.models.some((m) => m.id.startsWith("anthropic/")));
 	assert.ok(result.models.some((m) => m.id === "claude-sonnet-5-5"), "subscription stays available");
 	assert.throws(() => resolveModels({ ...cfg, apiBudgets: { openai: { monthlyUsd: 1 } } }, catalog), /Unknown apiBudgets provider: openai/);
+});
+
+test("--block anthropic blocks only the Anthropic API, not the Claude subscription", (t) => {
+	const home = tempHome(t);
+	assert.equal(normalizeBlockProvider("anthropic"), "anthropic");
+	assert.equal(normalizeBlockProvider("claude"), "claudeAgent");
+	recordProviderBlock(normalizeBlockProvider("Anthropic"), null, home);
+	const catalog = [
+		{ providerInstanceId: "claudeAgent", id: "claude-sonnet-5-5", label: "Sonnet", billing: "subscription", reasoningOptions: ["medium"] },
+		{ providerInstanceId: "opencode", id: "anthropic/claude-sonnet-5-5", label: "Sonnet API", billing: "api", reasoningOptions: ["medium"] },
+	];
+	const cfg = { ...config, budget: { ...config.budget, blockApiSubproviders: [] }, models: ["claude:all", "opencode:anthropic/*"] };
+	const result = resolveModels(cfg, catalog, null, { providerBlocks: readProviderBlocks(home) });
+	assert.ok(!result.models.some((m) => m.id.startsWith("anthropic/")));
+	assert.ok(result.models.some((m) => m.id === "claude-sonnet-5-5"), "subscription stays available");
+	assert.equal(result.quotaStatus.claudeAgent?.blocked ?? false, false);
 });
 
 test("speed settings produce explicit role-specific dispatch options", () => {

@@ -68,7 +68,7 @@ export function readProviderBlocks(homeDir = os.homedir(), nowMs = Date.now()) {
 }
 
 export function recordProviderBlock(provider, until, homeDir = os.homedir(), nowMs = Date.now()) {
-	if (!["codex", "claudeAgent", "opencode", "cloudflare"].includes(provider)) throw new Error(`Unknown block provider: ${provider}`);
+	if (!["codex", "claudeAgent", "opencode", "cloudflare", "anthropic"].includes(provider)) throw new Error(`Unknown block provider: ${provider}`);
 	if (until !== null && (!Number.isFinite(Date.parse(until)) || Date.parse(until) <= nowMs)) throw new Error("Block reset must be a future ISO timestamp; omit it when unknown");
 	updateProviderBlocks(homeDir, nowMs, (blocks) => { blocks[provider] = until; });
 }

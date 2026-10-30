@@ -55,7 +55,7 @@ After a confirmed limit error, the coordinator must inspect/cancel the old task 
 node ~/.agents/skills/task-router/scripts/resolve-models.mjs --block 'claude=2026-10-24T01:30:00Z'
 ```
 
-The timestamp above is only an example. Without a known reset, `--block claude` persists until verified recovery and `--unblock claude`. State is stored in `~/.config/task-router/provider-blocks.json`; timed blocks expire automatically. `cloudflare` blocks Workers AI only; `opencode` blocks the whole harness. Do not treat code/test failures or ordinary transport errors as exhausted quota.
+The timestamp above is only an example. Without a known reset, `--block claude` persists until verified recovery and `--unblock claude`. State is stored in `~/.config/task-router/provider-blocks.json`; timed blocks expire automatically. `cloudflare` blocks Workers AI only; `anthropic` blocks OpenCode `anthropic/*` API models only (use `claude` for the subscription); `opencode` blocks the whole harness. Do not treat code/test failures or ordinary transport errors as exhausted quota.
 
 Rerun the resolver, prefer an eligible alternative subscription, then allowed API models within their spending budget. Pass the original requirements, partial commits/work, failure, and remaining acceptance criteria. Never duplicate active workers, reset budgets, auto-enable overage, or expand a provider-only pool to escape a limit. Main-thread provider changes remain explicit; the resolver only recommends and filters.
 

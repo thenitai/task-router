@@ -104,7 +104,7 @@ Before dispatching or replacing a subagent, rerun the resolver with the same per
 
 On a confirmed usage, billing, or rate-limit rejection:
 1. Inspect the task's status and partial work. Cancel it if still active; do not start a duplicate worker.
-2. Record the affected provider and known reset: `node ~/.agents/skills/task-router/scripts/resolve-models.mjs --block 'claude=2026-10-24T01:30:00Z'` (example time only). Use the actual reset/Retry-After. `--block claude` persists a block when reset is unknown. Use `cloudflare` for Workers AI only; `opencode` blocks the entire harness.
+2. Record the affected provider and known reset: `node ~/.agents/skills/task-router/scripts/resolve-models.mjs --block 'claude=2026-10-24T01:30:00Z'` (example time only). Use the actual reset/Retry-After. `--block claude` persists a block when reset is unknown. Use `cloudflare` for Workers AI only and `anthropic` for OpenCode `anthropic/*` API models only (`claude` is the subscription); `opencode` blocks the entire harness.
 3. Rerun the resolver with the original provider restrictions, budget, and speed. Select an eligible model capable of the unfinished work; first try the other subscription, then an allowed API model within its cash budget. An independent reviewer stays independent. If no suitable model remains, stop that slice and report the reset/blocker; never widen the allowed pool or auto-enable paid overage.
 4. Reassign only unfinished work with the original brief, completed commits/files, failures, and acceptance criteria. Verify worktree state and ownership before resuming edits. This recovery is authorized by the approved routing plan; no new approval is needed unless scope or the spending allowance increases.
 
